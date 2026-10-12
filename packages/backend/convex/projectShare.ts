@@ -24,12 +24,15 @@ import {
 } from "./lib/data";
 import { alreadyExistsError, createError, ErrorCode, notFoundError } from "./lib/errors";
 import { createLogger } from "./lib/logger";
+import { inferValueChangedAt } from "./lib/rotation";
+import { loadKeyRotationTimestamps } from "./lib/rotationData";
 import { protectedAction, protectedQuery } from "./lib/middleware";
 import { ADD_ON_PRICES_USD, getPlanState, PLANS, paidSharesFor } from "./lib/plans";
 import { checkRateLimit } from "./lib/rateLimit";
 import { EmailKind, ErrorSeverity } from "./lib/types";
 import { createCheckoutUrlSafely } from "./project";
 import schema from "./schema";
+import { rotateProjectHistory } from "./secretHistory";
 
 const log = createLogger("projectShare");
 
@@ -315,6 +318,9 @@ const rotationArgs = {
       v.object({ serviceAccountId: v.id("serviceAccount"), newEncryptedProjectKey: v.string() }),
     ),
   ),
+  reEncryptedHistory: v.optional(
+    v.array(v.object({ historyId: v.id("secretHistory"), newEncryptedValue: v.string() })),
+  ),
 };
 
 function assertCovers(expected: string[], provided: string[], what: string) {
@@ -380,6 +386,10 @@ export const _revokeShareWithRotation = internalMutation({
     const now = Date.now();
     const oldKeyVersion = project.keyVersion;
     const newKeyVersion = oldKeyVersion + 1;
+    const secretsById = new Map(secrets.map((s) => [s._id, s]));
+    const keyRotationTimestamps = secrets.some((s) => s.valueChangedAt === undefined)
+      ? await loadKeyRotationTimestamps(ctx, project._id)
+      : [];
 
     await revokeAndCount(ctx, share);
     await ctx.db.patch(project._id, {
@@ -398,13 +408,25 @@ export const _revokeShareWithRotation = internalMutation({
       });
     }
     for (const { secretId, newEncryptedValue } of args.reEncryptedSecrets) {
+      // Re-encryption keeps the plaintext, so pin the value age before updatedAt moves.
+      const existing = secretsById.get(secretId);
       await ctx.db.patch(secretId, {
         encryptedValue: newEncryptedValue,
         encryptionKeyVersion: newKeyVersion,
+        valueChangedAt:
+          existing?.valueChangedAt ??
+          (existing ? inferValueChangedAt(existing, keyRotationTimestamps) : undefined),
         updatedAt: now,
         updatedBy: args.userId,
       });
     }
+
+    const { historyReEncrypted, historyPurged } = await rotateProjectHistory(
+      ctx,
+      project._id,
+      args.reEncryptedHistory ?? [],
+      newKeyVersion,
+    );
 
     await invalidateProjectCache(ctx, project._id);
 
@@ -416,6 +438,8 @@ export const _revokeShareWithRotation = internalMutation({
       reason: "share_revoked",
       secretsReEncrypted: args.reEncryptedSecrets.length,
       sharesUpdated: args.rewrappedShares.length,
+      historyReEncrypted,
+      historyPurged,
       createdAt: now,
     });
 
@@ -433,6 +457,8 @@ export const _revokeShareWithRotation = internalMutation({
         newKeyVersion,
         secretsReEncrypted: args.reEncryptedSecrets.length,
         sharesUpdated: args.rewrappedShares.length,
+        historyReEncrypted,
+        historyPurged,
       },
     });
     await requestUsageSync(ctx, args.userId);
@@ -443,6 +469,8 @@ export const _revokeShareWithRotation = internalMutation({
       secretsReEncrypted: args.reEncryptedSecrets.length,
       sharesRewrapped: args.rewrappedShares.length,
       serviceAccountsRewrapped: rewrappedServiceAccounts.length,
+      historyReEncrypted,
+      historyPurged,
     });
     return { success: true };
   },

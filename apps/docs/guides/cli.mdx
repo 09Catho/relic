@@ -47,6 +47,13 @@ List all projects you own or have been shared with, including their environments
 relic projects
 ```
 
+| Flag            | Description                                            |
+| --------------- | ------------------------------------------------------ |
+| `--json`        | Print projects, environments, and folders as JSON      |
+| `-p, --project` | Only show the project with this ID                     |
+
+With `--json`, errors are printed as `{"error": {"code": "...", "message": "..."}}` and the command exits with code 1. Codes include `not_logged_in` and `project_not_found`.
+
 ### `relic init`
 
 Initialize Relic in the current project. Creates `relic.toml` and a `.relic/` cache directory.
@@ -135,6 +142,282 @@ Print the installed version.
 relic version
 ```
 
+### `relic shell`
+
+Open an interactive subshell with secrets loaded as environment variables. Commands you run inside it can read the secrets without a `relic run` prefix or a `.env` file. Type `exit` to return to your original shell.
+
+```bash
+relic shell -e <environment> [options]
+```
+
+| Flag                | Description                                                   |
+| ------------------- | ------------------------------------------------------------- |
+| `-e, --environment` | Environment name (required)                                   |
+| `-f, --folder`      | Folder name                                                   |
+| `-s, --scope`       | Scope filter: `client`, `server`, or `shared`                 |
+| `-p, --project`     | Project ID (overrides `RELIC_PROJECT_ID` and `relic.toml`)    |
+| `--inherit-env`     | Pass the current environment (minus `RELIC_*`) to the shell   |
+| `--force`           | Open a nested shell even if already inside a relic shell      |
+
+**Examples:**
+
+```bash
+relic shell -e development
+relic shell -e staging -f database
+```
+
+The shell sets `RELIC_SHELL=1` and `RELIC_ENVIRONMENT` so you can show the active environment in your prompt. See [Local Development](/guides/local-development) for prompt snippets and details.
+
+### `relic import`
+
+Import secrets into an environment from a dotenv file, JSON, stdin, Doppler, Infisical, Vercel, or 1Password. Values are encrypted on your device before upload. Relic prints a plan with secret names only and asks before changing existing secrets.
+
+```bash
+relic import [source] -e <environment> [options]
+```
+
+`source` defaults to `.env`. Use a file path, `-` for stdin, or `doppler`, `infisical`, `vercel`, `1password`.
+
+| Flag                | Description                                                         |
+| ------------------- | ------------------------------------------------------------------- |
+| `-e, --environment` | Target environment (required)                                       |
+| `-f, --folder`      | Target folder                                                       |
+| `-p, --project`     | Project ID (overrides `relic.toml`)                                 |
+| `-s, --scope`       | Default scope for imported secrets: `client`, `server`, or `shared` |
+| `--format`          | `env` or `json` for files and stdin                                 |
+| `--overwrite`       | Replace existing secrets that have different values                 |
+| `--skip-existing`   | Keep existing secrets and import only new ones                      |
+| `--dry-run`         | Print the plan without importing                                    |
+| `-y, --yes`         | Skip confirmation prompts                                           |
+| `--delete-source`   | Delete the source file after a successful import (asks first)       |
+
+**Examples:**
+
+```bash
+relic import -e development
+relic import .env.production -e production --dry-run
+cat secrets.json | relic import - -e staging --skip-existing
+relic import doppler -e production --doppler-project web --doppler-config prd
+relic import vercel -e production
+```
+
+See [Migrating to Relic](/guides/importing) for provider flags, conflict handling, and parsing rules.
+
+### `relic push`
+
+Sync an environment's secrets into a deploy platform's secret store. Supported targets are Vercel, Cloudflare Workers, GitHub Actions, and Fly.io. See [Platform Sync](/guides/platform-sync) for authentication and platform options.
+
+```bash
+relic push -e <environment> --target <platform> [options]
+```
+
+| Flag                | Description                                                         |
+| ------------------- | ------------------------------------------------------------------- |
+| `-e, --environment` | Environment name (required)                                         |
+| `-t, --target`      | `vercel`, `cloudflare`, `github`, or `fly` (required)               |
+| `-f, --folder`      | Folder name                                                         |
+| `-s, --scope`       | Scopes to include, comma separated: `client`, `server`, `shared`    |
+| `-p, --project`     | Project ID (overrides `RELIC_PROJECT_ID` and `relic.toml`)          |
+| `--dry-run`         | Print the plan (names only) and exit                                |
+| `--prune`           | Delete platform secrets that aren't in Relic                        |
+| `-y, --yes`         | Skip confirmation. Required in CI and non-interactive shells        |
+
+**Examples:**
+
+```bash
+relic push -e production --target vercel --dry-run
+relic push -e production --target vercel --scope client,shared
+relic push -e staging --target cloudflare --wrangler-env staging
+relic push -e production --target github --github-env production --yes
+```
+
+### `relic check`
+
+Check that every key your app needs exists in an environment before you deploy. Relic compares secret names only; it never fetches or decrypts values, so it doesn't need your password.
+
+```bash
+relic check -e <environment> [options]
+```
+
+Required keys come from `.env.example`, `.env.sample`, and `.env.template` next to `relic.toml`, plus any env reads found by `--scan`. The command exits with code `1` when a required key is missing.
+
+| Flag                | Description                                                                    |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `-e, --environment` | Environment name (required)                                                    |
+| `-f, --folder`      | Folder name                                                                    |
+| `-s, --scope`       | Scope filter: `client`, `server`, or `shared`                                  |
+| `-p, --project`     | Project ID (overrides `relic.toml`)                                            |
+| `--from <file>`     | Read required keys from this file instead of the default templates. Repeatable |
+| `--scan [paths...]` | Also scan source files for env reads. Defaults to the project root             |
+| `--ignore <keys>`   | Keys to skip, comma-separated. `*` matches any characters. Repeatable          |
+| `--compare <env>`   | Show key names that exist in only one of the two environments                  |
+| `--strict`          | Also fail on unused keys and on differences found by `--compare`               |
+| `--json`            | Print the result as JSON                                                       |
+
+**Examples:**
+
+```bash
+relic check -e production
+relic check -e production --scan src
+relic check -e staging -f api --from services/api/.env.example
+relic check -e staging --compare production
+```
+
+See [Checking required keys](/guides/check) for how keys are discovered, the JSON format, and CI usage.
+
+### `relic guard`
+
+Block commits that contain dotenv files or the values of your Relic secrets. Matching happens on your device. See [Leak Guard](/guides/leak-guard) for details.
+
+```bash
+relic guard scan [paths...] [options]   # Scan files, staged changes, or a commit range
+relic guard install                     # Add a pre-commit hook
+relic guard uninstall                   # Remove the pre-commit hook
+```
+
+| Flag                  | Description                                                     |
+| --------------------- | --------------------------------------------------------------- |
+| `--staged`            | Scan staged content from the git index                          |
+| `--range <rev-range>` | Scan lines added in a commit range                              |
+| `-e, --environment`   | Environment whose values to match (repeatable, default: all)    |
+| `-p, --project`       | Project ID (overrides `relic.toml`)                             |
+| `--min-length`        | Skip secret values shorter than this (default: `8`)             |
+| `--no-values`         | Only check for dotenv files                                     |
+| `--require-values`    | Fail when secret values can't be loaded                         |
+| `--json`              | Print results as JSON                                           |
+
+The command exits with `1` when it finds a leak and `2` on errors.
+
+**Examples:**
+
+```bash
+relic guard scan --staged
+relic guard scan --range origin/main..HEAD -e production
+relic guard scan src --json
+```
+
+### `relic secrets`
+
+List the secret names in an environment. Values are never fetched or printed.
+
+```bash
+relic secrets -e <environment> [options]
+```
+
+| Flag                | Description                                   |
+| ------------------- | --------------------------------------------- |
+| `-e, --environment` | Environment name (required)                   |
+| `-f, --folder`      | Only list secrets in this folder              |
+| `-s, --scope`       | Scope filter: `client`, `server`, or `shared` |
+| `-p, --project`     | Project ID (overrides `relic.toml`)           |
+| `--json`            | Print machine-readable JSON                   |
+
+```bash
+relic secrets -e development --json
+```
+
+```json
+{
+  "projectId": "jx7abc123",
+  "environment": "development",
+  "folder": null,
+  "folders": ["database"],
+  "secrets": [
+    { "name": "DATABASE_URL", "scope": "server", "folder": "database" },
+    { "name": "PUBLIC_API_URL", "scope": "client", "folder": null }
+  ]
+}
+```
+
+With `--json`, errors are printed as `{"error": {"code": "...", "message": "..."}}` and the command exits with code 1. Codes include `not_logged_in`, `no_config`, `environment_not_found`, `folder_not_found`, and `invalid_option`.
+
+<Info>
+  `relic secrets` uses your `relic login` session. It does not support `RELIC_API_KEY` or
+  `RELIC_SERVICE_TOKEN`.
+</Info>
+
+### `relic history`
+
+List previous versions of a secret. Values are masked unless you pass `--reveal`, which decrypts them locally after a confirmation.
+
+```bash
+relic history <KEY> -e <environment> [options]
+```
+
+| Flag                | Description                                        |
+| ------------------- | -------------------------------------------------- |
+| `-e, --environment` | Environment name (required)                        |
+| `-f, --folder`      | Folder name                                        |
+| `-p, --project`     | Project ID (overrides `relic.toml`)                |
+| `--reveal`          | Decrypt and print values                           |
+| `--json`            | Print JSON. Values are included only with `--reveal` |
+| `-y, --yes`         | Skip the `--reveal` confirmation                   |
+
+**Examples:**
+
+```bash
+relic history DATABASE_URL -e production
+relic history STRIPE_KEY -e staging -f payments --reveal
+relic history API_KEY -e production --json
+```
+
+### `relic rollback`
+
+Restore a previous version of a secret as its current value. Also restores deleted secrets.
+
+```bash
+relic rollback <KEY> -e <environment> --to <version> [options]
+```
+
+| Flag                | Description                                       |
+| ------------------- | ------------------------------------------------- |
+| `-e, --environment` | Environment name (required)                       |
+| `--to`              | Version to restore, e.g. `3` or `v3` (required)   |
+| `-f, --folder`      | Folder name                                       |
+| `-p, --project`     | Project ID (overrides `relic.toml`)               |
+| `-y, --yes`         | Skip the confirmation (required in non-TTY shells) |
+
+**Examples:**
+
+```bash
+relic rollback DATABASE_URL -e production --to 2
+relic rollback OLD_TOKEN -e staging --to 4 --yes
+```
+
+See [Secret History](/guides/secret-history) for how versions, retention, and access work.
+
+### `relic rotation`
+
+Check how old secret values are and manage rotation policies. Only names, timestamps, and policies are read; values are never decrypted. See [Secret Rotation](/guides/rotation) for how ages and statuses are calculated.
+
+```bash
+relic rotation status [-e <environment>] [-p <project>] [--json] [--fail-on-overdue]
+relic rotation set [KEY] -e <environment> --every <days> [-f <folder>]
+relic rotation clear [KEY] -e <environment> [-f <folder>]
+```
+
+Omit `KEY` to set or clear the environment policy. A secret policy overrides the environment policy.
+
+| Flag                | Description                                                         |
+| ------------------- | ------------------------------------------------------------------- |
+| `-e, --environment` | Environment name. Optional for `status`, required for `set`/`clear` |
+| `-f, --folder`      | Folder containing `KEY`                                             |
+| `-p, --project`     | Project ID (overrides `relic.toml`)                                 |
+| `--every`           | Rotation interval in whole days, 1 to 3650                          |
+| `--json`            | Print the status report as JSON                                     |
+| `--fail-on-overdue` | Exit with code `1` when any secret is overdue                       |
+
+**Examples:**
+
+```bash
+relic rotation status -e production
+relic rotation set -e production --every 90
+relic rotation set STRIPE_SECRET_KEY -e production --every 30
+relic rotation clear STRIPE_SECRET_KEY -e production
+```
+
+With `RELIC_SERVICE_TOKEN` set, `relic rotation status` authenticates with the service account and checks the project it belongs to.
+
 ### `relic telemetry`
 
 Manage anonymous usage telemetry.
@@ -156,6 +439,23 @@ project_id = "your-project-id"
 ```
 
 The CLI walks up from the current directory to find `relic.toml`. You can override the project ID with `--project` (highest precedence) or `RELIC_PROJECT_ID`.
+
+An optional `[check]` table configures [`relic check`](/guides/check):
+
+```toml
+project_id = "your-project-id"
+
+[check]
+ignore = ["NODE_ENV", "PORT"]
+```
+
+An optional `[guard]` table configures [`relic guard`](/guides/leak-guard):
+
+```toml
+[guard]
+allow = ["test/.env.test"]  # dotenv files that may be committed
+min_length = 8
+```
 
 ## Caching
 

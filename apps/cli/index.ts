@@ -1,11 +1,18 @@
 import { initLogger, isFirstRun, saveTelemetryPreference } from "@repo/logger";
 import { Command, CommanderError, Help } from "commander";
 import pc from "picocolors";
+import check, { type CheckOptions } from "./commands/check";
+import { type GuardScanOptions, guardInstall, guardScan, guardUninstall } from "./commands/guard";
+import { history, rollback } from "./commands/history";
+import importSecrets, { type ImportOptions } from "./commands/import";
 import init from "./commands/init";
 import login from "./commands/login";
 import logout from "./commands/logout";
-import projects from "./commands/projects";
+import projects, { type ProjectsOptions } from "./commands/projects";
+import push from "./commands/push";
+import { rotationClear, rotationSet, rotationStatus } from "./commands/rotation";
 import run, { type RunOptions } from "./commands/run";
+import secrets, { type SecretsOptions } from "./commands/secrets";
 import {
   type ServiceAccountCreateOptions,
   type ServiceAccountRevokeOptions,
@@ -13,9 +20,11 @@ import {
   serviceAccountList,
   serviceAccountRevoke,
 } from "./commands/service-account";
+import shell, { type ShellOptions } from "./commands/shell";
 import { telemetryDisable, telemetryEnable, telemetryStatus } from "./commands/telemetry";
 import upgrade from "./commands/upgrade";
 import whoami from "./commands/whoami";
+import type { PushOptions } from "./lib/push/types";
 import pkg from "./package.json";
 
 await initLogger();
@@ -54,7 +63,19 @@ const COMMAND_GROUPS = [
   },
   {
     label: "Secrets",
-    commands: ["run", "service-account"],
+    commands: [
+      "run",
+      "shell",
+      "import",
+      "push",
+      "check",
+      "guard",
+      "secrets",
+      "history",
+      "rollback",
+      "rotation",
+      "service-account",
+    ],
   },
   {
     label: "Tools",
@@ -97,6 +118,9 @@ function formatCustomHelp(): string {
   lines.push(`    ${pc.dim("$")} relic login`);
   lines.push(`    ${pc.dim("$")} relic init`);
   lines.push(`    ${pc.dim("$")} relic run -e production -- npm start`);
+  lines.push(`    ${pc.dim("$")} relic shell -e development`);
+  lines.push(`    ${pc.dim("$")} relic push -e production --target vercel --dry-run`);
+  lines.push(`    ${pc.dim("$")} relic check -e production --scan`);
   lines.push("");
 
   lines.push(`  ${pc.dim("https://docs.withrelic.com")}`);
@@ -152,7 +176,12 @@ const program = new Command()
 program.command("login").description("Authenticate with Relic").action(login);
 program.command("logout").description("Clear authentication").action(logout);
 program.command("whoami").description("Show current user").action(whoami);
-program.command("projects").description("List all projects").action(projects);
+program
+  .command("projects")
+  .description("List all projects")
+  .option("--json", "Output machine-readable JSON")
+  .option("-p, --project <id>", "Only show this project")
+  .action((options: ProjectsOptions) => projects(options));
 program.command("init").description("Initialize Relic for the current project").action(init);
 
 const telemetryCmd = program
@@ -192,6 +221,61 @@ saCmd
   .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
   .action((options: ServiceAccountRevokeOptions) => serviceAccountRevoke(options));
 
+const rotationCmd = program
+  .command("rotation")
+  .description("Track secret value age and rotation policies");
+
+rotationCmd
+  .command("status")
+  .description("Show secret ages and rotation status")
+  .option("-e, --environment <name>", "Environment name (optional, defaults to all)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option("--json", "Output as JSON")
+  .option("--fail-on-overdue", "Exit with code 1 when any secret is overdue")
+  .action(
+    (options: {
+      environment?: string;
+      project?: string;
+      json?: boolean;
+      failOnOverdue?: boolean;
+    }) => {
+      rotationStatus(options);
+    },
+  );
+
+rotationCmd
+  .command("set")
+  .description("Set a rotation policy for a secret, or for an environment when KEY is omitted")
+  .argument("[key]", "Secret key (omit to set the environment policy)")
+  .requiredOption("--every <days>", "Rotation interval in days")
+  .option("-e, --environment <name>", "Environment name (required)")
+  .option("-f, --folder <name>", "Folder name (optional, only with KEY)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .action(
+    (
+      key: string | undefined,
+      options: { every: string; environment?: string; folder?: string; project?: string },
+    ) => {
+      rotationSet(key, options);
+    },
+  );
+
+rotationCmd
+  .command("clear")
+  .description("Clear a rotation policy for a secret, or for an environment when KEY is omitted")
+  .argument("[key]", "Secret key (omit to clear the environment policy)")
+  .option("-e, --environment <name>", "Environment name (required)")
+  .option("-f, --folder <name>", "Folder name (optional, only with KEY)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .action(
+    (
+      key: string | undefined,
+      options: { environment?: string; folder?: string; project?: string },
+    ) => {
+      rotationClear(key, options);
+    },
+  );
+
 program
   .command("mcp")
   .description("Start the Relic MCP server for AI assistants")
@@ -229,6 +313,196 @@ program
   .passThroughOptions()
   .addHelpText("after", RUN_HELP)
   .action((command: string[], options: RunOptions) => run(command, options));
+
+program
+  .command("shell")
+  .description("Open a subshell with secrets loaded as environment variables")
+  .requiredOption("-e, --environment <name>", "Environment name (required)")
+  .option("-f, --folder <name>", "Folder name (optional)")
+  .option("-s, --scope <scope>", "Scope filter: client, server, or shared (optional)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option(
+    "--inherit-env",
+    "Pass the current environment (except RELIC_* variables) to the shell; secrets take precedence",
+  )
+  .option("--force", "Open a nested shell even if already inside a relic shell")
+  .action((options: ShellOptions) => shell(options));
+
+program
+  .command("import")
+  .description("Import secrets from a .env file, JSON, or another secrets manager")
+  .argument(
+    "[source]",
+    "Path to a .env or .json file, - for stdin, or doppler, infisical, vercel, 1password (default: .env)",
+  )
+  .requiredOption("-e, --environment <name>", "Environment name (required)")
+  .option("-f, --folder <name>", "Folder name (optional)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option("-s, --scope <scope>", "Default scope for imported secrets: client, server, or shared")
+  .option("--format <format>", "Input format for files and stdin: env or json")
+  .option("--overwrite", "Overwrite existing secrets with imported values")
+  .option("--skip-existing", "Keep existing secrets and import only new ones")
+  .option("--dry-run", "Show the import plan without importing")
+  .option("-y, --yes", "Skip confirmation prompts")
+  .option("--delete-source", "Delete the source file after a successful import (asks first)")
+  .option("--doppler-project <name>", "Doppler project (doppler source)")
+  .option("--doppler-config <name>", "Doppler config (doppler source)")
+  .option("--infisical-env <slug>", "Infisical environment slug (infisical source)")
+  .option("--infisical-path <path>", "Infisical secret path (infisical source)")
+  .option("--infisical-project <id>", "Infisical project ID (infisical source)")
+  .option("--vercel-project <idOrName>", "Vercel project ID or name (vercel source)")
+  .option("--vercel-team <id>", "Vercel team ID (vercel source)")
+  .option("--vercel-target <target>", "production, preview, or development (vercel source)")
+  .option("--op-item <item>", "1Password item name or ID (1password source)")
+  .option("--op-vault <vault>", "1Password vault (1password source)")
+  .action((source: string | undefined, options: ImportOptions) => importSecrets(source, options));
+
+const collect = (value: string, previous: string[] = []) => [...previous, value];
+
+program
+  .command("push")
+  .description("Sync an environment's secrets to a deploy platform")
+  .requiredOption("-e, --environment <name>", "Environment name (required)")
+  .requiredOption("-t, --target <platform>", "Target platform: vercel, cloudflare, github, fly")
+  .option("-f, --folder <name>", "Folder name (optional)")
+  .option("-s, --scope <scopes>", "Scope filter, comma separated: client, server, shared")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option("--dry-run", "Print the plan (names only) and exit without writing")
+  .option("--prune", "Delete platform secrets that are not in Relic")
+  .option("-y, --yes", "Skip the confirmation prompt (required in CI and non-interactive shells)")
+  .option("--vercel-project <id>", "Vercel project ID or name (defaults to .vercel/project.json)")
+  .option("--vercel-team <id>", "Vercel team ID or slug (defaults to .vercel/project.json)")
+  .option(
+    "--vercel-target <target>",
+    "Vercel target: production, preview, development (repeatable or comma separated)",
+    collect,
+  )
+  .option("--worker <name>", "Cloudflare Worker name (defaults to the wrangler config)")
+  .option("--wrangler-env <env>", "Wrangler environment (as in wrangler --env)")
+  .option("--github-repo <owner/repo>", "GitHub repository (defaults to the current repo)")
+  .option("--github-env <name>", "GitHub environment for environment-level secrets")
+  .option("--fly-app <name>", "Fly app name (defaults to fly.toml)")
+  .option("--fly-stage", "Stage Fly secrets without restarting machines")
+  .action((options: PushOptions) => {
+    push(options);
+  });
+
+program
+  .command("check")
+  .description("Check that required env keys exist in an environment (names only)")
+  .requiredOption("-e, --environment <name>", "Environment name (required)")
+  .option("-f, --folder <name>", "Folder name (optional)")
+  .option("-s, --scope <scope>", "Scope filter: client, server, or shared (optional)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option(
+    "--from <file>",
+    "Read required keys from this file instead of .env.example/.sample/.template (repeatable)",
+    collect,
+    [],
+  )
+  .option("--scan [paths...]", "Also scan source files for env reads (defaults to project root)")
+  .option(
+    "--ignore <keys>",
+    "Keys to skip, comma-separated, * wildcards allowed (repeatable)",
+    collect,
+    [],
+  )
+  .option("--compare <environment>", "Compare key names with another environment")
+  .option("--strict", "Also fail on unused keys and differences from --compare")
+  .option("--json", "Print the result as JSON")
+  .action((options: CheckOptions) => {
+    check(options);
+  });
+
+const guardCmd = program
+  .command("guard")
+  .description("Block commits that leak secrets or dotenv files");
+
+guardCmd
+  .command("scan")
+  .description("Scan files, staged changes, or a commit range for leaked secrets")
+  .argument("[paths...]", "Files or directories to scan (default: current directory)")
+  .option("--staged", "Scan staged content from the git index")
+  .option("--range <rev-range>", "Scan lines added in a commit range (e.g. origin/main..HEAD)")
+  .option(
+    "-e, --environment <name>",
+    "Environment whose values to match (repeatable, default: all)",
+    collect,
+  )
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option("--min-length <n>", "Skip secret values shorter than this (default: 8)")
+  .option("--no-values", "Only check for dotenv files, skip secret value matching")
+  .option("--require-values", "Fail when secret values can't be loaded")
+  .option("--json", "Print results as JSON")
+  .action((paths: string[], options: GuardScanOptions) => guardScan(paths, options));
+
+guardCmd
+  .command("install")
+  .description("Add a pre-commit hook that runs relic guard scan --staged")
+  .option("-y, --yes", "Edit hook manager config (lefthook.yml) without asking")
+  .action((options: { yes?: boolean }) => guardInstall(options));
+
+guardCmd
+  .command("uninstall")
+  .description("Remove the relic guard pre-commit hook")
+  .option("-y, --yes", "Edit hook manager config (lefthook.yml) without asking")
+  .action((options: { yes?: boolean }) => guardUninstall(options));
+
+program
+  .command("secrets")
+  .description("List secret names in an environment (never values)")
+  .requiredOption("-e, --environment <name>", "Environment name (required)")
+  .option("-f, --folder <name>", "Folder name (optional)")
+  .option("-s, --scope <scope>", "Scope filter: client, server, or shared (optional)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option("--json", "Output machine-readable JSON")
+  .action((options: SecretsOptions) => secrets(options));
+
+program
+  .command("history")
+  .description("List previous versions of a secret")
+  .requiredOption("-e, --environment <name>", "Environment name (required)")
+  .option("-f, --folder <name>", "Folder name (optional)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option("--reveal", "Decrypt values locally and print them")
+  .option("--json", "Print machine-readable JSON")
+  .option("-y, --yes", "Skip the --reveal confirmation")
+  .argument("<key>", "Secret key")
+  .action(
+    (
+      key: string,
+      options: {
+        environment: string;
+        folder?: string;
+        project?: string;
+        reveal?: boolean;
+        json?: boolean;
+        yes?: boolean;
+      },
+    ) => history(key, options),
+  );
+
+program
+  .command("rollback")
+  .description("Restore a previous version of a secret")
+  .requiredOption("-e, --environment <name>", "Environment name (required)")
+  .requiredOption("--to <version>", "Version to restore (see relic history)")
+  .option("-f, --folder <name>", "Folder name (optional)")
+  .option("-p, --project <id>", "Project ID (optional, defaults to relic.toml or RELIC_PROJECT_ID)")
+  .option("-y, --yes", "Skip the confirmation prompt")
+  .argument("<key>", "Secret key")
+  .action(
+    (
+      key: string,
+      options: {
+        environment: string;
+        to: string;
+        folder?: string;
+        project?: string;
+        yes?: boolean;
+      },
+    ) => rollback(key, options),
+  );
 
 program
   .command("version")

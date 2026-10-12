@@ -17,6 +17,18 @@ Relic reads the following environment variables. None of them are required for n
 
 `relic run` (on macOS and Linux) and the MCP server don't pass `RELIC_*` variables from your environment to the command they run.
 
+## Platform Sync
+
+Used by [`relic push`](/guides/platform-sync). Each one is optional when you're logged in with the platform's own CLI.
+
+| Variable                | Description                                                                                                  | Default                                  |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------- |
+| `VERCEL_TOKEN`          | Vercel access token for `--target vercel`.                                                                   | Read from the Vercel CLI `auth.json`     |
+| `CLOUDFLARE_API_TOKEN`  | Cloudflare API token with Workers Scripts: Edit. Used by wrangler, or by Relic directly when wrangler is not installed. | Your `wrangler login` session            |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID, required with `CLOUDFLARE_API_TOKEN` when wrangler is not installed.                  | `account_id` from your wrangler config   |
+| `GH_TOKEN`              | GitHub token read by the GitHub CLI for `--target github`.                                                   | Your `gh auth login` session             |
+| `FLY_API_TOKEN`         | Fly.io token read by flyctl for `--target fly`.                                                              | Your `fly auth login` session            |
+
 ## Server
 
 | Variable                | Description                                                          | Default                   |
@@ -52,12 +64,34 @@ Relic reads the following environment variables. None of them are required for n
 | ------------------- | --------------------------------------------------------------------------------------------------- | ---------- |
 | `RELIC_INSTALL_DIR` | Install location for the `curl` install script. `relic upgrade` reuses the running binary's folder. | `~/.relic` |
 
+## Importing
+
+Read by [`relic import vercel`](/guides/importing#vercel). Flags take precedence over these variables.
+
+| Variable            | Description                                                         | Default                               |
+| ------------------- | ------------------------------------------------------------------- | ------------------------------------- |
+| `VERCEL_TOKEN`      | Vercel access token used to read project environment variables.     | Token from `vercel login`             |
+| `VERCEL_PROJECT_ID` | Vercel project ID or name. Overridden by `--vercel-project`.        | Read from `.vercel/project.json`      |
+| `VERCEL_ORG_ID`     | Vercel team ID. Overridden by `--vercel-team`.                      | Read from `.vercel/project.json`      |
+
 ## Runtime
 
 | Variable | Description                                                                                                                                   | Default |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | `DEV`    | Set to `true` to enable development mode. Switches server URLs to localhost, enables console logging, debug log file, and disables telemetry. | Not set |
 | `CI`     | When set (any value), disables telemetry and console logging. Detected automatically by most CI providers.                                    | Not set |
+
+## Set by `relic shell`
+
+[`relic shell`](/guides/local-development) sets these inside the subshell. You don't set them yourself.
+
+| Variable            | Description                                                                         |
+| ------------------- | ----------------------------------------------------------------------------------- |
+| `RELIC_SHELL`       | `1` inside a relic shell. Used to refuse nested shells unless `--force` is passed.  |
+| `RELIC_ENVIRONMENT` | Environment name of the active shell.                                               |
+| `RELIC_PROJECT_ID`  | Project ID of the active shell. Not set when using a service token.                 |
+| `RELIC_FOLDER`      | Folder passed with `-f`, if any.                                                    |
+| `RELIC_SCOPE`       | Scope passed with `-s`, if any.                                                     |
 
 ## CI/CD Quick Reference
 

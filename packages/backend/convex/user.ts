@@ -332,6 +332,11 @@ export const _cascadeDeleteUserData = internalMutation({
               .take(n),
           (n: number) =>
             ctx.db
+              .query("secretHistory")
+              .withIndex("by_project", (q) => q.eq("projectId", projectId))
+              .take(n),
+          (n: number) =>
+            ctx.db
               .query("folder")
               .withIndex("by_project", (q) => q.eq("projectId", projectId))
               .take(n),
@@ -445,6 +450,12 @@ export const _cascadeDeleteUserData = internalMutation({
         .withIndex("by_user", (q) => q.eq("userId", userId))
         .unique();
       if (billingSync) await ctx.db.delete(billingSync._id);
+
+      const rotationDigest = await ctx.db
+        .query("rotationDigestSubscription")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .first();
+      if (rotationDigest) await ctx.db.delete(rotationDigest._id);
 
       phase = "ownLogs";
     }

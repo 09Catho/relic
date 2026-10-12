@@ -14,10 +14,13 @@ import {
   type LucideIcon,
   Pencil,
   Plus,
+  RotateCcw,
+  RefreshCw,
   Shield,
   Trash2,
   UserMinus,
   UserPlus,
+  Upload,
   UserX,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -51,6 +54,12 @@ interface ActionLog {
     exportFormat?: string;
     reason?: string;
     apiKeyPrefix?: string;
+    pushTarget?: string;
+    pushDestination?: string;
+    pushDryRun?: boolean;
+    restoredVersion?: number;
+    wasDeleted?: boolean;
+    rotateEveryDays?: number;
   };
 }
 
@@ -81,6 +90,13 @@ function prefix(p: string | undefined) {
   return p ? `${p}…` : undefined;
 }
 
+const PUSH_TARGET_LABELS: Record<string, string> = {
+  vercel: "Vercel",
+  cloudflare: "Cloudflare",
+  github: "GitHub Actions",
+  fly: "Fly.io",
+};
+
 function describe(log: ActionLog): Described {
   const m = log.metadata ?? {};
   switch (log.action) {
@@ -108,6 +124,29 @@ function describe(log: ActionLog): Described {
         tone: "danger",
         category: "secrets",
       };
+    case "secret.restored":
+      return {
+        text: [
+          m.wasDeleted ? "Deleted secret restored" : "Secret restored",
+          m.restoredVersion && `to v${m.restoredVersion}`,
+        ]
+          .filter(Boolean)
+          .join(" "),
+        subject: m.key,
+        icon: RotateCcw,
+        tone: "success",
+        category: "secrets",
+      };
+    case "rotation.policy_updated":
+      return {
+        text: m.rotateEveryDays
+          ? `Rotation policy set to every ${m.rotateEveryDays}d`
+          : "Rotation policy cleared",
+        subject: m.key,
+        icon: RefreshCw,
+        tone: "info",
+        category: "secrets",
+      };
     case "secret.exported":
     case "secrets.bulk_exported":
       return {
@@ -117,6 +156,17 @@ function describe(log: ActionLog): Described {
         tone: "accent",
         category: "secrets",
       };
+    case "secrets.pushed": {
+      const target = m.pushTarget && (PUSH_TARGET_LABELS[m.pushTarget] ?? m.pushTarget);
+      const verb = m.pushDryRun ? "Push planned (dry run)" : "Secrets pushed";
+      return {
+        text: target ? `${verb} to ${target}` : verb,
+        subject: m.pushDestination ?? count(m.exportCount, "item"),
+        icon: Upload,
+        tone: "accent",
+        category: "secrets",
+      };
+    }
     case "secrets.bulk.updated":
       return {
         text: "Bulk update",

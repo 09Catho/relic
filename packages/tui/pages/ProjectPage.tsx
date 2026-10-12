@@ -3,12 +3,14 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { extractErrorMessage } from "@repo/auth";
 import { trackEvent } from "@repo/logger";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { InlineInput } from "../components/forms/InlineInput";
 import { BulkImportModal } from "../components/modals/BulkImportModal";
 import { CheckoutRedirectModal } from "../components/modals/CheckoutRedirectModal";
 import { CommandPaletteModal } from "../components/modals/CommandPaletteModal";
 import { ConfirmPaymentModal } from "../components/modals/ConfirmPaymentModal";
 import { ManageCollaboratorsModal } from "../components/modals/ManageCollaboratorsModal";
 import { ProWelcomeModal } from "../components/modals/ProWelcomeModal";
+import { SecretHistoryModal } from "../components/modals/SecretHistoryModal";
 import { PasswordInput } from "../components/PasswordInput";
 import { ProjectItemList } from "../components/project/ProjectItemList";
 import { GuideBar } from "../components/shared/GuideBar";
@@ -32,6 +34,7 @@ import {
   THEME_COLORS,
 } from "../utils/constants";
 import { buildProjectItems, type ProjectLocation, secretsInView } from "../utils/projectItems";
+import { POLICY_INPUT_MAX_LENGTH, parsePolicyInput } from "../utils/rotation";
 import { openUrl, truncate } from "../utils/ui";
 
 interface ProjectPageProps {
@@ -63,7 +66,7 @@ export function ProjectPage({
   const renderer = useRenderer();
   const { width, height } = useTerminalDimensions();
   const { goBack: routerGoBack } = useRouter();
-  const { isProcessing, showError } = useTaskQueue();
+  const { isProcessing, showError, showSuccess, attemptTask } = useTaskQueue();
 
   const {
     project,
@@ -86,11 +89,13 @@ export function ProjectPage({
     createEnv,
     updateEnv,
     removeEnv,
+    setEnvRotationPolicy,
     createFolder,
     updateFolder,
     deleteFolder,
     updateSecretBulk,
     deleteSecret,
+    setSecretRotationPolicy,
     shareProject,
     revokeShare,
     revokeShareWithRotation,
@@ -104,6 +109,14 @@ export function ProjectPage({
   const [showSecrets, setShowSecrets] = useState(false);
   const [revealedValues, setRevealedValues] = useState<Map<string, string> | null>(null);
   const [activeModal, setActiveModal] = useState<ModalType>("none");
+  const [editingPolicy, setEditingPolicy] = useState<{
+    type: "env" | "secret";
+    id: string;
+    name: string;
+    rotateEveryDays?: number;
+  } | null>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const [isSavingPolicy, setIsSavingPolicy] = useState(false);
   const closeModal = () => setActiveModal("none");
 
   const projectStatus: ProjectStatus =
@@ -174,6 +187,7 @@ export function ProjectPage({
     },
   });
   const selectedItem = items[navigation.selectedIndex];
+  const selectedSecret = selectedItem?.type === "secret" ? selectedItem : null;
 
   const leaveEnvironment = () => {
     setShowSecrets(false);
@@ -280,6 +294,10 @@ export function ProjectPage({
     else setActiveModal("manageCollaborators");
   };
 
+  const openHistory = () => {
+    if (selectedSecret) setActiveModal("secretHistory");
+  };
+
   const startCreate = () =>
     whenWritable(() => {
       if (viewLevel === "environments") itemActions.setCreatingItem("env");
@@ -308,6 +326,55 @@ export function ProjectPage({
       }
     });
 
+  const openPolicyEditor = () =>
+    whenWritable(() => {
+      const target =
+        selectedItem?.type === "env" || selectedItem?.type === "secret"
+          ? { ...selectedItem, type: selectedItem.type }
+          : selectedEnv
+            ? { ...selectedEnv, type: "env" as const }
+            : null;
+      if (!target) return;
+      setPolicyError(null);
+      setEditingPolicy({
+        type: target.type,
+        id: target.id,
+        name: target.name,
+        rotateEveryDays: target.rotateEveryDays,
+      });
+    });
+
+  const savePolicy = async (input: string) => {
+    if (isSavingPolicy || !editingPolicy) return;
+    const parsed = parsePolicyInput(input);
+    if (!parsed.ok) {
+      setPolicyError(parsed.error);
+      return;
+    }
+    const { rotateEveryDays } = parsed;
+    if (rotateEveryDays === (editingPolicy.rotateEveryDays ?? null)) {
+      setEditingPolicy(null);
+      return;
+    }
+    const { type, id, name } = editingPolicy;
+    const label = type === "env" ? `environment "${name}"` : name;
+    setIsSavingPolicy(true);
+    const saved = await attemptTask(`Updating rotation policy for ${label}...`, () =>
+      type === "env"
+        ? setEnvRotationPolicy(id, rotateEveryDays)
+        : setSecretRotationPolicy(id, rotateEveryDays),
+    );
+    setIsSavingPolicy(false);
+    if (!saved) return;
+    trackEvent("rotation_policy_updated", { target: type, cleared: rotateEveryDays === null });
+    showSuccess(
+      rotateEveryDays === null
+        ? `Rotation policy cleared for ${label}`
+        : `${label} rotates every ${rotateEveryDays}d`,
+    );
+    setEditingPolicy(null);
+  };
+
   const startEdit = () => {
     if (viewLevel !== "environments") whenWritable(openEditor);
   };
@@ -320,6 +387,12 @@ export function ProjectPage({
         { key: "n", description: "Create environment", category: "Create", disabled: isReadOnly },
         { key: "u", description: "Rename environment", category: "Manage", disabled: isReadOnly },
         { key: "d", description: "Delete environment", category: "Manage", disabled: isReadOnly },
+        {
+          key: "r",
+          description: "Set environment rotation policy",
+          category: "Manage",
+          disabled: isReadOnly,
+        },
         { key: "g", description: "Open dashboard", category: "Navigate" },
         { key: "esc", description: "Back to home", category: "Navigate" },
       );
@@ -348,10 +421,22 @@ export function ProjectPage({
           category: "Manage",
           disabled: isReadOnly || !selectedItem,
         },
+        {
+          key: "r",
+          description:
+            selectedItem?.type === "secret"
+              ? "Set secret rotation policy"
+              : "Set environment rotation policy",
+          category: "Manage",
+          disabled: isReadOnly,
+        },
         { key: "g", description: "Open dashboard", category: "Navigate" },
         { key: "esc", description: "Go back", category: "Navigate" },
         { key: "v", description: showSecrets ? "Hide values" : "Show values", category: "View" },
       );
+      if (selectedSecret) {
+        cmds.push({ key: "t", description: "Secret history", category: "View" });
+      }
     }
     cmds.push(
       {
@@ -390,6 +475,12 @@ export function ProjectPage({
       case "v":
         toggleSecrets();
         break;
+      case "t":
+        openHistory();
+        break;
+      case "r":
+        openPolicyEditor();
+        break;
       case "g":
         void openUrl(DASHBOARD_URL);
         break;
@@ -399,11 +490,11 @@ export function ProjectPage({
     }
   };
 
-  const isBusy = isProcessing || collaborators.isBusy || itemActions.isBusy;
+  const isBusy = isProcessing || collaborators.isBusy || itemActions.isBusy || isSavingPolicy;
 
   useKeyboard((key) => {
     if (proNotice.visible) return;
-    if (creatingItem || editingItem) return;
+    if (creatingItem || editingItem || editingPolicy) return;
     if (payment.isModalOpen) return;
 
     if (unlock.isPromptVisible) {
@@ -418,7 +509,13 @@ export function ProjectPage({
       return;
     }
 
-    if (activeModal === "commandPalette" || activeModal === "manageCollaborators") return;
+    if (
+      activeModal === "commandPalette" ||
+      activeModal === "manageCollaborators" ||
+      activeModal === "secretHistory"
+    ) {
+      return;
+    }
 
     if (confirmingDelete) {
       if (key.name === "y") void itemActions.deleteItem();
@@ -456,6 +553,10 @@ export function ProjectPage({
       openCollaborators();
     } else if (key.name === "v" && viewLevel !== "environments") {
       toggleSecrets();
+    } else if (key.name === "t") {
+      openHistory();
+    } else if (key.name === "r") {
+      openPolicyEditor();
     } else if (key.name === "q") {
       renderer.destroy();
     } else if (key.sequence === "?") {
@@ -466,7 +567,7 @@ export function ProjectPage({
   const getShortcuts = () => {
     const isDisabled = isBusy;
 
-    if (creatingItem || editingItem) {
+    if (creatingItem || editingItem || editingPolicy) {
       return {
         primary: [
           {
@@ -494,6 +595,7 @@ export function ProjectPage({
             { key: "n", description: "new environment", disabled },
             { key: "u", description: "rename", disabled: disabled || !hasSelection },
             { key: "d", description: "delete", disabled: disabled || !hasSelection },
+            { key: "r", description: "rotation", disabled: disabled || !hasSelection },
           ]
         : [
             { key: "e", description: "edit secrets", disabled },
@@ -511,6 +613,8 @@ export function ProjectPage({
                 ]
               : []),
             { key: "d", description: "delete", disabled: disabled || !hasSelection },
+            { key: "r", description: "rotation", disabled },
+            ...(selectedSecret ? [{ key: "t", description: "history", disabled: isDisabled }] : []),
           ];
 
     const secondary: Shortcut[] = [
@@ -614,6 +718,7 @@ export function ProjectPage({
             scrollOffset={navigation.scrollOffset}
             pageSize={PAGE_SIZE}
             showSecrets={showSecrets}
+            environmentRotateEveryDays={selectedEnv?.rotateEveryDays}
             isLoading={viewLevel === "environments" ? isLoadingEnvs : isEnvironmentLoading}
             error={listError || null}
             emptyMessage={emptyMessage}
@@ -625,6 +730,32 @@ export function ProjectPage({
             onRename={itemActions.renameItem}
             onCancelRename={() => itemActions.setEditingItem(null)}
           />
+
+          {editingPolicy && (
+            <box flexDirection="column" width={CONTENT_WIDTH}>
+              <text fg={THEME_COLORS.textDim}>
+                {"  "}Rotate <span fg={THEME_COLORS.text}>{truncate(editingPolicy.name, 30)}</span>{" "}
+                every N days · 0 clears
+              </text>
+              <InlineInput
+                active={!isSavingPolicy}
+                initialValue={
+                  editingPolicy.rotateEveryDays ? String(editingPolicy.rotateEveryDays) : ""
+                }
+                onSubmit={(value) => void savePolicy(value)}
+                onCancel={() => setEditingPolicy(null)}
+                onChange={() => setPolicyError(null)}
+                maxWidth={10}
+                maxLength={POLICY_INPUT_MAX_LENGTH}
+                width={CONTENT_WIDTH}
+                icon="[↻]"
+                iconColor={THEME_COLORS.secondary}
+                placeholder="e.g. 90"
+                showCount={false}
+                error={policyError}
+              />
+            </box>
+          )}
 
           <box flexDirection="column" marginTop={1}>
             <box
@@ -678,6 +809,18 @@ export function ProjectPage({
         pendingEmail={collaborators.pendingEmail}
         shareLimits={shareLimits}
         inputDisabled={payment.isModalOpen || proNotice.visible}
+      />
+
+      <SecretHistoryModal
+        visible={activeModal === "secretHistory"}
+        secretId={selectedSecret?.id ?? null}
+        secretKey={selectedSecret?.name ?? ""}
+        showValues={showSecrets}
+        isRestricted={isReadOnly}
+        onRestored={() => {
+          if (selectedEnvId) void loadEnvironment(selectedEnvId);
+        }}
+        onClose={closeModal}
       />
 
       <CheckoutRedirectModal checkoutUrl={payment.checkoutUrl} onClose={payment.closeCheckout} />

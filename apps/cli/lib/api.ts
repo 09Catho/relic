@@ -1,5 +1,11 @@
 import { CONVEX_SITE_URL, CONVEX_URL, ensureValidJwt, SITE_URL } from "@repo/auth";
-import { api, type Id, type TableNames } from "@repo/backend";
+import {
+  api,
+  type Id,
+  type RotationPolicySource,
+  type RotationStatus,
+  type TableNames,
+} from "@repo/backend";
 import { ConvexHttpClient } from "convex/browser";
 import { trackCliError } from "./telemetry";
 import type { SecretScope } from "./types";
@@ -64,8 +70,33 @@ export interface ProjectListItem {
 export interface Environment {
   id: string;
   name: string;
+  slug?: string;
   projectId: string;
   color?: string;
+  rotateEveryDays?: number;
+}
+
+export interface SecretRotationEntry {
+  secretId: string;
+  key: string;
+  environmentId: string;
+  environmentName: string;
+  folderId: string | null;
+  folderName: string | null;
+  valueChangedAt: number;
+  ageDays: number;
+  rotateEveryDays: number | null;
+  policySource: RotationPolicySource | null;
+  status: RotationStatus;
+  dueAt: number | null;
+  daysUntilDue: number | null;
+}
+
+export interface ProjectRotationStatus {
+  projectId: string;
+  projectName: string;
+  generatedAt: number;
+  secrets: SecretRotationEntry[];
 }
 
 export interface Folder {
@@ -104,6 +135,71 @@ export interface Project {
   encryptedProjectKey: string;
   keyVersion: number;
   isArchived: boolean;
+  ownerId: string;
+}
+
+export interface BulkSecretInput {
+  secretId?: string;
+  key: string;
+  encryptedValue: string;
+  valueType: "string" | "number" | "boolean";
+  scope?: "client" | "server" | "shared";
+}
+
+export interface BulkUpdateResult {
+  success: boolean;
+  updatedCount: number;
+  createdCount: number;
+  skippedCount: number;
+  secretIds: string[];
+}
+
+export interface SecretNamesRequest {
+  environmentName: string;
+  folderName?: string;
+  scope?: SecretScope;
+}
+
+export interface SecretNames {
+  secrets: {
+    key: string;
+    scope: SecretScope;
+    valueType: "string" | "number" | "boolean";
+  }[];
+  count: number;
+}
+
+export type SecretChangeType = "updated" | "deleted" | "restored";
+
+export interface SecretHistoryVersion {
+  id: string;
+  version: number;
+  key: string;
+  encryptedValue: string;
+  valueType: "string" | "number" | "boolean";
+  scope: "client" | "server" | "shared";
+  changeType: SecretChangeType;
+  changedBy: string;
+  changedByEmail: string | null;
+  changedAt: number;
+}
+
+export interface SecretHistory {
+  secret: {
+    id: string;
+    key: string;
+    isDeleted: boolean;
+    currentVersion: number | null;
+    encryptedValue: string | null;
+    valueType: "string" | "number" | "boolean";
+    scope: "client" | "server" | "shared";
+    updatedBy: string;
+    updatedByEmail: string | null;
+    updatedAt: number;
+  };
+  versions: SecretHistoryVersion[];
+  encryptedProjectKey: string;
+  retentionLimit: number;
 }
 
 export interface FullUser extends User {
@@ -133,6 +229,12 @@ export interface ExportSecretsResult {
   encryptedProjectKey: string;
   environmentId: string;
   folderId: string | null;
+}
+
+export interface PushAuditInfo {
+  target: string;
+  destination?: string;
+  dryRun?: boolean;
 }
 
 function toId<T extends TableNames>(id: string): Id<T> {
@@ -238,9 +340,58 @@ export class ProtectedApi {
     return result.map((e) => ({
       id: String(e.id),
       name: e.name,
+      slug: e.slug,
       projectId: String(e.projectId),
       color: e.color,
+      rotateEveryDays: e.rotateEveryDays,
     }));
+  }
+
+  async getRotationStatus(
+    projectId: string,
+    environmentId?: string,
+  ): Promise<ProjectRotationStatus> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.rotation.getProjectRotationStatus, {
+        projectId: toId<"project">(projectId),
+        environmentId: environmentId ? toId<"environment">(environmentId) : undefined,
+      }),
+    );
+    return {
+      projectId: String(result.projectId),
+      projectName: result.projectName,
+      generatedAt: result.generatedAt,
+      secrets: result.secrets.map((s) => ({
+        ...s,
+        secretId: String(s.secretId),
+        environmentId: String(s.environmentId),
+        folderId: s.folderId ? String(s.folderId) : null,
+      })),
+    };
+  }
+
+  async setSecretRotationPolicy(
+    secretId: string,
+    rotateEveryDays: number | null,
+  ): Promise<{ success: boolean }> {
+    return await this.withAuth(() =>
+      this.client.mutation(api.rotation.setSecretRotationPolicy, {
+        secretId: toId<"secret">(secretId),
+        rotateEveryDays,
+      }),
+    );
+  }
+
+  async setEnvironmentRotationPolicy(
+    environmentId: string,
+    rotateEveryDays: number | null,
+  ): Promise<{ success: boolean }> {
+    return await this.withAuth(() =>
+      this.client.mutation(api.rotation.setEnvironmentRotationPolicy, {
+        environmentId: toId<"environment">(environmentId),
+        rotateEveryDays,
+      }),
+    );
   }
 
   async getEnvironmentData(environmentId: string): Promise<EnvironmentData> {
@@ -282,6 +433,33 @@ export class ProtectedApi {
       encryptedProjectKey: result.encryptedProjectKey,
       keyVersion: result.keyVersion,
       isArchived: result.isArchived,
+      ownerId: String(result.ownerId),
+    };
+  }
+
+  async updateSecretBulk(args: {
+    environmentId: string;
+    folderId?: string;
+    secrets: BulkSecretInput[];
+    mode?: "skip" | "overwrite";
+  }): Promise<BulkUpdateResult> {
+    const result = await this.withAuth(() =>
+      this.client.mutation(api.secret.updateSecretBulk, {
+        environmentId: toId<"environment">(args.environmentId),
+        folderId: args.folderId ? toId<"folder">(args.folderId) : undefined,
+        secrets: args.secrets.map((s) => ({
+          secretId: s.secretId ? toId<"secret">(s.secretId) : undefined,
+          key: s.key,
+          encryptedValue: s.encryptedValue,
+          valueType: s.valueType,
+          scope: s.scope,
+        })),
+        mode: args.mode,
+      }),
+    );
+    return {
+      ...result,
+      secretIds: result.secretIds.map((id) => String(id)),
     };
   }
 
@@ -324,6 +502,8 @@ export class ProtectedApi {
     folderName?: string;
     folderId?: string;
     scope?: SecretScope;
+    scopes?: SecretScope[];
+    push?: PushAuditInfo;
   }): Promise<ExportSecretsResult> {
     const result = await this.withAuth(() =>
       this.client.mutation(api.secret.exportSecrets, {
@@ -333,6 +513,8 @@ export class ProtectedApi {
         folderName: args.folderName,
         folderId: toOptionalId<"folder">(args.folderId),
         scope: args.scope,
+        scopes: args.scopes,
+        push: args.push,
       }),
     );
 
@@ -343,6 +525,53 @@ export class ProtectedApi {
       environmentId: String(result.environmentId),
       folderId: result.folderId ? String(result.folderId) : null,
     };
+  }
+
+  async listSecretNames(args: SecretNamesRequest & { projectId: string }): Promise<SecretNames> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.secret.listSecretNames, {
+        projectId: toId<"project">(args.projectId),
+        environmentName: args.environmentName,
+        folderName: args.folderName,
+        scope: args.scope,
+      }),
+    );
+    return { secrets: result.secrets, count: result.count };
+  }
+
+  async getSecretHistory(args: {
+    projectId: string;
+    environmentName: string;
+    folderName?: string;
+    key: string;
+  }): Promise<SecretHistory> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.secretHistory.getSecretHistoryByKey, {
+        projectId: toId<"project">(args.projectId),
+        environmentName: args.environmentName,
+        folderName: args.folderName,
+        key: args.key,
+      }),
+    );
+    return {
+      secret: { ...result.secret, id: String(result.secret.id) },
+      versions: result.versions.map((entry) => ({ ...entry, id: String(entry.id) })),
+      encryptedProjectKey: result.encryptedProjectKey,
+      retentionLimit: result.retentionLimit,
+    };
+  }
+
+  async restoreSecretVersion(
+    secretId: string,
+    version: number,
+  ): Promise<{ restoredVersion: number; wasDeleted: boolean }> {
+    const result = await this.withAuth(() =>
+      this.client.mutation(api.secretHistory.restoreSecretVersion, {
+        secretId: toId<"secret">(secretId),
+        version,
+      }),
+    );
+    return { restoredVersion: result.restoredVersion, wasDeleted: result.wasDeleted };
   }
 
   async createServiceAccount(args: {
@@ -481,6 +710,8 @@ export async function exportSecretsViaApiKey(
     environmentName: string;
     folderName?: string;
     scope?: string;
+    scopes?: string[];
+    push?: PushAuditInfo;
   },
 ): Promise<ExportSecretsHttpResponse> {
   return requestSiteApi("/api/secrets/export", {
@@ -496,10 +727,57 @@ export async function exportSecretsViaServiceToken(
     environmentName?: string;
     folderName?: string;
     scope?: string;
+    scopes?: string[];
+    push?: PushAuditInfo;
   },
   oidcToken?: string,
 ): Promise<ServiceAccountExportResponse> {
   return requestSiteApi("/api/sa/secrets/export", {
+    token: serviceToken,
+    body,
+    headers: oidcToken ? { "X-Oidc-Token": oidcToken } : undefined,
+    proPlanMessage: "Service accounts require a Pro plan.",
+  });
+}
+
+async function requestSecretNames(
+  path: string,
+  options: Parameters<typeof requestSiteApi>[1],
+): Promise<SecretNames> {
+  const result = await requestSiteApi<SecretNames>(path, options);
+  return { secrets: result.secrets, count: result.count };
+}
+
+export async function listSecretNamesViaApiKey(
+  apiKey: string,
+  body: SecretNamesRequest & { projectId: string },
+): Promise<SecretNames> {
+  return requestSecretNames("/api/secrets/names", {
+    token: apiKey,
+    body,
+    proPlanMessage: "API keys require a Pro plan.",
+  });
+}
+
+export async function listSecretNamesViaServiceToken(
+  serviceToken: string,
+  body: SecretNamesRequest,
+  oidcToken?: string,
+): Promise<SecretNames> {
+  return requestSecretNames("/api/sa/secrets/names", {
+    token: serviceToken,
+    body,
+    headers: oidcToken ? { "X-Oidc-Token": oidcToken } : undefined,
+    proPlanMessage: "Service accounts require a Pro plan.",
+  });
+}
+
+export async function getRotationStatusViaServiceToken(
+  serviceToken: string,
+  body: { environmentName?: string },
+  oidcToken?: string,
+): Promise<ProjectRotationStatus> {
+  return requestSiteApi("/api/sa/rotation/status", {
     token: serviceToken,
     body,
     headers: oidcToken ? { "X-Oidc-Token": oidcToken } : undefined,

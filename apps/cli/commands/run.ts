@@ -32,8 +32,8 @@ import {
   fetchUserKeysViaApiKey,
   getApi,
   ProPlanRequiredError,
-  REQUEST_TIMEOUT_MS,
   type ProtectedApi,
+  type PushAuditInfo,
   type SecretData,
 } from "../lib/api";
 import {
@@ -48,6 +48,7 @@ import {
 } from "../lib/cli";
 import { decryptSecrets, getProjectKey, ProjectKeyError } from "../lib/crypto";
 import { buildChildEnv } from "../lib/env";
+import { resolveOidcToken } from "../lib/oidc";
 import { exitWithTelemetry } from "../lib/telemetry";
 import type { SecretScope } from "../lib/types";
 
@@ -65,12 +66,18 @@ export interface RunOptions {
   inheritEnv?: boolean;
 }
 
+export interface SecretFetchOptions {
+  scopes?: SecretScope[];
+  /** Push exports always hit the server so the audit event is recorded, and never touch the cache. */
+  push?: PushAuditInfo;
+}
+
 export interface PrepareSecretsResult {
   secrets: Record<string, string>;
   count: number;
 }
 
-interface UserKeys {
+export interface UserKeys {
   encryptedPrivateKey: string;
   salt: string;
   fromCache: boolean;
@@ -84,7 +91,15 @@ function isApiKeyMode(): boolean {
   return !!process.env.RELIC_API_KEY;
 }
 
-function isCiEnvironment(): boolean {
+export type AuthMode = "service_token" | "api_key" | "session";
+
+export function getAuthMode(): AuthMode {
+  if (isServiceTokenMode()) return "service_token";
+  if (isApiKeyMode()) return "api_key";
+  return "session";
+}
+
+export function isCiEnvironment(): boolean {
   return !!(
     process.env.CI ||
     process.env.GITHUB_ACTIONS ||
@@ -95,7 +110,7 @@ function isCiEnvironment(): boolean {
   );
 }
 
-function injectedMessage(count: number): string {
+export function injectedMessage(count: number): string {
   return `Injected ${count} secret${count !== 1 ? "s" : ""}`;
 }
 
@@ -144,6 +159,7 @@ async function fetchAndCacheUserKeysViaApiKey(
 export async function prepareSecretsWithApiKey(
   projectId: string,
   options: RunOptions,
+  fetchOptions: SecretFetchOptions = {},
 ): Promise<PrepareSecretsResult> {
   const apiKey = process.env.RELIC_API_KEY;
   if (!apiKey) {
@@ -164,6 +180,8 @@ export async function prepareSecretsWithApiKey(
     environmentName: options.environment,
     folderName: options.folder,
     scope: options.scope,
+    scopes: fetchOptions.scopes,
+    push: fetchOptions.push,
   });
 
   if (result.count === 0) {
@@ -189,38 +207,9 @@ export async function prepareSecretsWithApiKey(
   return { secrets: await decryptToEnv(projectKey, result.secrets), count: result.count };
 }
 
-async function resolveOidcToken(): Promise<string | undefined> {
-  if (process.env.RELIC_OIDC_TOKEN) {
-    return process.env.RELIC_OIDC_TOKEN;
-  }
-
-  const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-  const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-  if (requestUrl && requestToken) {
-    try {
-      const response = await fetch(`${requestUrl}&audience=relic`, {
-        headers: { Authorization: `bearer ${requestToken}` },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-      if (response.ok) {
-        const data = (await response.json()) as { value?: string };
-        return data.value;
-      }
-    } catch {
-      log.warn("Failed to request GitHub Actions OIDC token");
-    }
-  }
-
-  // Legacy GitLab (< 17.0) predefined token; newer GitLab requires `id_tokens: RELIC_OIDC_TOKEN`.
-  if (process.env.CI_JOB_JWT_V2) {
-    return process.env.CI_JOB_JWT_V2;
-  }
-
-  return undefined;
-}
-
 export async function prepareSecretsWithServiceToken(
   options: RunOptions,
+  fetchOptions: SecretFetchOptions = {},
 ): Promise<PrepareSecretsResult> {
   const serviceToken = process.env.RELIC_SERVICE_TOKEN;
   if (!serviceToken) {
@@ -235,6 +224,8 @@ export async function prepareSecretsWithServiceToken(
       environmentName: options.environment,
       folderName: options.folder,
       scope: options.scope,
+      scopes: fetchOptions.scopes,
+      push: fetchOptions.push,
     },
     oidcToken,
   );
@@ -252,6 +243,10 @@ export async function prepareSecretsWithServiceToken(
   );
 
   return { secrets: await decryptToEnv(projectKey, result.secrets), count: result.count };
+}
+
+export async function resolveUserKeys(userKeyDb: Database, api: ProtectedApi): Promise<UserKeys> {
+  return readCachedUserKeys(userKeyDb) ?? (await fetchAndCacheUserKeys(userKeyDb, api));
 }
 
 async function fetchAndCacheUserKeys(userKeyDb: Database, api: ProtectedApi): Promise<UserKeys> {
@@ -289,7 +284,23 @@ async function resolveSecrets(
   projectId: string,
   options: RunOptions,
   api: ProtectedApi,
+  fetchOptions: SecretFetchOptions,
 ): Promise<{ secrets: SecretData[]; encryptedProjectKey: string }> {
+  if (fetchOptions.push) {
+    const result = await api.exportSecrets({
+      projectId,
+      environmentName: options.environment,
+      folderName: options.folder,
+      scope: options.scope,
+      scopes: fetchOptions.scopes,
+      push: fetchOptions.push,
+    });
+    if (result.count === 0) {
+      throw new Error("No secrets found");
+    }
+    return { secrets: result.secrets, encryptedProjectKey: result.encryptedProjectKey };
+  }
+
   const cachedEnvironmentId = getCachedEnvironmentId(db, projectId, options.environment);
 
   if (cachedEnvironmentId) {
@@ -355,7 +366,7 @@ async function resolveSecrets(
   return { secrets, encryptedProjectKey: result.encryptedProjectKey };
 }
 
-async function resolveProjectKey(
+export async function resolveProjectKey(
   encryptedProjectKey: string,
   userKeys: UserKeys,
   userKeyDb: Database,
@@ -381,9 +392,16 @@ export async function prepareSecrets(
   db: Database,
   userKeyDb: Database,
   api: ProtectedApi,
+  fetchOptions: SecretFetchOptions = {},
 ): Promise<PrepareSecretsResult> {
   const userKeys = readCachedUserKeys(userKeyDb) ?? (await fetchAndCacheUserKeys(userKeyDb, api));
-  const { secrets, encryptedProjectKey } = await resolveSecrets(db, projectId, options, api);
+  const { secrets, encryptedProjectKey } = await resolveSecrets(
+    db,
+    projectId,
+    options,
+    api,
+    fetchOptions,
+  );
   const projectKey = await resolveProjectKey(encryptedProjectKey, userKeys, userKeyDb, api);
 
   return { secrets: await decryptToEnv(projectKey, secrets), count: secrets.length };
@@ -464,6 +482,47 @@ async function prepareWithSession(
   return prepareSecrets(projectId, options, db, userKeyDb, getApi());
 }
 
+export function loadSecrets(
+  spinner: Ora,
+  options: RunOptions,
+  mode: AuthMode,
+): Promise<PrepareSecretsResult> {
+  switch (mode) {
+    case "service_token":
+      return prepareWithServiceToken(spinner, options);
+    case "api_key":
+      return prepareWithApiKey(spinner, options);
+    case "session":
+      return prepareWithSession(spinner, options);
+  }
+}
+
+/** Exits with 1 when `--environment` is missing or `--scope` is invalid; normalizes the scope. */
+export async function validateRunOptions(options: RunOptions): Promise<void> {
+  if (!options.environment) {
+    console.error(pc.red("Error: -e, --environment is required"));
+    await exitWithTelemetry(1);
+  }
+
+  if (options.scope) {
+    const scope = options.scope.toLowerCase() as SecretScope;
+    if (!SECRET_SCOPES.includes(scope)) {
+      console.error(pc.red("Error: --scope must be: client, server, or shared"));
+      await exitWithTelemetry(1);
+    }
+    options.scope = scope;
+  }
+}
+
+export async function failRun(spinner: Ora, err: unknown): Promise<never> {
+  if (err instanceof ProPlanRequiredError) {
+    await failWithUpgradePrompt(spinner, err.message, err.upgradeUrl);
+  }
+
+  spinner.fail(pc.red(getErrorMessage(err)));
+  return exitWithTelemetry(1);
+}
+
 /** Resolves like the runner does: the child's PATH (secrets may override it) or a direct path. */
 export function commandExists(program: string, path: string | undefined): boolean {
   if (program.includes("/") || program.includes("\\")) {
@@ -480,12 +539,11 @@ export function toProcessExitCode(runnerExitCode: number): number {
   return runnerExitCode === RUNNER_ERROR ? COMMAND_NOT_FOUND_EXIT_CODE : runnerExitCode;
 }
 
-async function executeCommand(
+/** Runs `command` through the runner with `childEnv`; returns the process exit code. */
+export async function runWithEnv(
   command: string[],
   childEnv: Record<string, string>,
-  count: number,
-  startTime: number,
-): Promise<never> {
+): Promise<number> {
   const runner = await RunnerBridge.getInstance();
 
   const commandBuffer = Buffer.from(`${JSON.stringify(command)}\0`, "utf-8");
@@ -499,10 +557,19 @@ async function executeCommand(
     secretsBuffer.fill(0);
   }
 
-  const processExitCode = toProcessExitCode(exitCode);
   if (exitCode === RUNNER_ERROR) {
     console.error(pc.red(`✖ Failed to start \`${command[0]}\``));
   }
+  return toProcessExitCode(exitCode);
+}
+
+async function executeCommand(
+  command: string[],
+  childEnv: Record<string, string>,
+  count: number,
+  startTime: number,
+): Promise<never> {
+  const processExitCode = await runWithEnv(command, childEnv);
 
   trackEvent("cli_run_completed", {
     secret_count: count,
@@ -514,26 +581,14 @@ async function executeCommand(
 }
 
 export default async function run(command: string[], options: RunOptions) {
-  if (!options.environment) {
-    console.error(pc.red("Error: -e, --environment is required"));
-    await exitWithTelemetry(1);
-  }
+  await validateRunOptions(options);
 
   if (command.length === 0) {
     console.error(pc.red("Error: No command specified"));
     await exitWithTelemetry(1);
   }
 
-  if (options.scope) {
-    const scope = options.scope.toLowerCase() as SecretScope;
-    if (!SECRET_SCOPES.includes(scope)) {
-      console.error(pc.red("Error: --scope must be: client, server, or shared"));
-      await exitWithTelemetry(1);
-    }
-    options.scope = scope;
-  }
-
-  const mode = isServiceTokenMode() ? "service_token" : isApiKeyMode() ? "api_key" : "session";
+  const mode = getAuthMode();
   const startTime = Date.now();
   trackEvent("cli_run_started", {
     has_folder: !!options.folder,
@@ -545,12 +600,7 @@ export default async function run(command: string[], options: RunOptions) {
   const spinner = ora();
 
   try {
-    const { secrets, count } =
-      mode === "service_token"
-        ? await prepareWithServiceToken(spinner, options)
-        : mode === "api_key"
-          ? await prepareWithApiKey(spinner, options)
-          : await prepareWithSession(spinner, options);
+    const { secrets, count } = await loadSecrets(spinner, options, mode);
 
     const childEnv = options.inheritEnv ? buildChildEnv(process.env, secrets) : secrets;
     const program = command[0]!;
@@ -569,12 +619,6 @@ export default async function run(command: string[], options: RunOptions) {
   } catch (err) {
     log.error("Run failed", err);
     trackEvent("cli_run_completed", { success: false, duration_ms: Date.now() - startTime });
-
-    if (err instanceof ProPlanRequiredError) {
-      await failWithUpgradePrompt(spinner, err.message, err.upgradeUrl);
-    }
-
-    spinner.fail(pc.red(getErrorMessage(err)));
-    await exitWithTelemetry(1);
+    await failRun(spinner, err);
   }
 }
