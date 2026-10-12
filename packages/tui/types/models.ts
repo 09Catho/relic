@@ -6,11 +6,13 @@ export interface Project {
   id: string;
   name: string;
   status: ProjectStatus;
+  isOwner: boolean;
 }
 
 export interface Environment {
   id: string;
   name: string;
+  rotateEveryDays?: number;
 }
 
 export interface Folder {
@@ -22,12 +24,14 @@ export interface Folder {
 export interface Secret {
   id: string;
   key: string;
-  value?: string;
   encryptedValue?: string;
+  encryptionKeyVersion?: number;
   type?: SecretValueType;
   scope?: SecretScope;
   folderId?: string;
   environmentId: string;
+  valueChangedAt?: number;
+  rotateEveryDays?: number;
 }
 
 export interface SharedUser {
@@ -52,6 +56,7 @@ export type ModalType =
   | "createFolder"
   | "createSecret"
   | "manageCollaborators"
+  | "secretHistory"
   | "commandPalette"
   | "bulkImport"
   | "logout"

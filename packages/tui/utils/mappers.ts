@@ -10,6 +10,7 @@ export function mapApiEnvironment(apiEnv: ApiEnvironment): Environment {
   return {
     id: apiEnv.id,
     name: apiEnv.name,
+    rotateEveryDays: apiEnv.rotateEveryDays,
   };
 }
 
@@ -25,8 +26,8 @@ export function mapApiSecret(apiSecret: ApiSecret): Secret {
   return {
     id: apiSecret.id,
     key: apiSecret.key,
-    value: undefined,
     encryptedValue: apiSecret.encryptedValue,
+    encryptionKeyVersion: apiSecret.encryptionKeyVersion,
     type:
       apiSecret.valueType === "string"
         ? "string"
@@ -38,6 +39,8 @@ export function mapApiSecret(apiSecret: ApiSecret): Secret {
     scope: apiSecret.scope,
     folderId: apiSecret.folderId,
     environmentId: apiSecret.environmentId,
+    valueChangedAt: apiSecret.valueChangedAt,
+    rotateEveryDays: apiSecret.rotateEveryDays,
   };
 }
 

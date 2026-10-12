@@ -1,13 +1,17 @@
 import { v } from "convex/values";
+import { getProjectOrThrow } from "./lib/data";
 import { doc } from "convex-helpers/validators";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
-import { internalMutation, internalQuery } from "./_generated/server";
-import { assertProjectAccess } from "./lib/access";
+import { internalMutation, internalQuery, type QueryCtx } from "./_generated/server";
+import { assertProjectAccess, assertProjectWriteAccess } from "./lib/access";
 import { alreadyExistsError, createError, ErrorCode, notFoundError } from "./lib/errors";
 import { generateSlug } from "./lib/helpers";
 import { protectedMutation, protectedQuery } from "./lib/middleware";
+import { buildExportAudit, type PushAudit, pushAuditValidator } from "./lib/push";
 import { checkRateLimit } from "./lib/rateLimit";
+import { inferValueChangedAt } from "./lib/rotation";
+import { loadKeyRotationTimestamps } from "./lib/rotationData";
 import {
   ErrorSeverity,
   type ProtectedMutationCtx,
@@ -43,7 +47,84 @@ type ServiceAccountExportResult = {
   folderId: Id<"folder"> | null;
 };
 
-const MAX_SECRETS_PER_ENVIRONMENT = 1024;
+export const MAX_SECRETS_PER_ENVIRONMENT = 1024;
+
+export const STALE_PROJECT_KEY_MESSAGE =
+  "The project key changed. Reload the project and try again.";
+
+/** Rejects writes encrypted with a project key the client loaded before a rotation. */
+function assertExpectedKeyVersion(project: Doc<"project">, expectedKeyVersion?: number): void {
+  if (expectedKeyVersion !== undefined && expectedKeyVersion !== project.keyVersion) {
+    createError({
+      code: ErrorCode.INVALID_RESOURCE_STATE,
+      message: STALE_PROJECT_KEY_MESSAGE,
+      severity: ErrorSeverity.Medium,
+    });
+  }
+}
+
+function assertFolderInEnvironment(folder: Doc<"folder">, environment: Doc<"environment">): void {
+  if (folder.environmentId !== environment._id || folder.projectId !== environment.projectId) {
+    createError({
+      code: ErrorCode.INVALID_ARGUMENTS,
+      message: "Folder does not belong to this environment",
+      severity: ErrorSeverity.Medium,
+    });
+  }
+}
+
+async function countActiveSecretsInEnvironment(
+  ctx: Pick<QueryCtx, "db">,
+  environmentId: Id<"environment">,
+): Promise<number> {
+  const secrets = await ctx.db
+    .query("secret")
+    .withIndex("by_environment_deleted", (q) =>
+      q.eq("environmentId", environmentId).eq("isDeleted", false),
+    )
+    .take(MAX_SECRETS_PER_ENVIRONMENT + 1);
+  return secrets.length;
+}
+
+async function findActiveSecretByKey(
+  ctx: Pick<QueryCtx, "db">,
+  environmentId: Id<"environment">,
+  folderId: Id<"folder"> | undefined,
+  key: string,
+): Promise<Doc<"secret"> | null> {
+  return await ctx.db
+    .query("secret")
+    .withIndex("by_env_folder_key", (q) =>
+      q
+        .eq("environmentId", environmentId)
+        .eq("folderId", folderId)
+        .eq("key", key)
+        .eq("isDeleted", false),
+    )
+    .first();
+}
+
+/** Throws when renaming `secret` to `newKey` would collide with another live secret in its folder. */
+async function assertRenameAvailable(
+  ctx: Pick<QueryCtx, "db">,
+  secret: Doc<"secret">,
+  newKey: string | undefined,
+): Promise<void> {
+  if (newKey === undefined || newKey === secret.key) return;
+  const clash = await findActiveSecretByKey(ctx, secret.environmentId, secret.folderId, newKey);
+  if (clash && clash._id !== secret._id) {
+    alreadyExistsError("secret", ErrorSeverity.Medium);
+  }
+}
+
+function environmentLimitError(currentCount: number, key: string): never {
+  return createError({
+    code: ErrorCode.ENVIRONMENT_LIMIT_REACHED,
+    message: `Cannot create new secret "${key}". Environment already has ${currentCount} secrets. Maximum ${MAX_SECRETS_PER_ENVIRONMENT} secrets per environment.`,
+    severity: ErrorSeverity.High,
+  });
+}
+
 export const createSecret = protectedMutation({
   args: {
     environmentId: v.id("environment"),
@@ -52,6 +133,7 @@ export const createSecret = protectedMutation({
     encryptedValue: v.string(),
     valueType: v.union(v.literal("string"), v.literal("number"), v.literal("boolean")),
     scope: v.optional(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+    expectedKeyVersion: v.optional(v.number()),
     // description: v.optional(v.string()),
     // tags: v.optional(v.array(v.string())),
   },
@@ -65,6 +147,7 @@ export const createSecret = protectedMutation({
       encryptedValue: string;
       valueType: "string" | "number" | "boolean";
       scope?: "client" | "server" | "shared";
+      expectedKeyVersion?: number;
     },
   ) => {
     const environmentResult = await ctx.runQuery(internal.environment._loadEnvironmentById, {
@@ -72,14 +155,14 @@ export const createSecret = protectedMutation({
     });
     const environment = environmentResult as Doc<"environment">;
 
-    const projectResult = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: environment.projectId,
-    });
+    const projectResult = await getProjectOrThrow(ctx, environment.projectId);
     const project = projectResult as Doc<"project">;
 
-    await assertProjectAccess(ctx, project);
+    await assertProjectWriteAccess(ctx, project);
 
     await checkRateLimit(ctx, "write");
+
+    assertExpectedKeyVersion(project, args.expectedKeyVersion);
 
     let folder: Doc<"folder"> | undefined;
 
@@ -88,6 +171,7 @@ export const createSecret = protectedMutation({
       folder = await ctx.runQuery(internal.folder._loadFolderById, {
         folderId: args.folderId,
       });
+      assertFolderInEnvironment(folder, environment);
     }
 
     // NOTE: loads the secret and checks the its existence to prevent duplications
@@ -99,6 +183,11 @@ export const createSecret = protectedMutation({
 
     if (secret) {
       throw alreadyExistsError("secret", ErrorSeverity.Medium);
+    }
+
+    const existingCount = await countActiveSecretsInEnvironment(ctx, args.environmentId);
+    if (existingCount >= MAX_SECRETS_PER_ENVIRONMENT) {
+      environmentLimitError(existingCount, args.key);
     }
 
     // create secret using project's current key version
@@ -145,13 +234,11 @@ export const getSecret = protectedQuery({
 
     const secretInstance = secret as Doc<"secret"> | null;
 
-    if (!secretInstance) {
+    if (!secretInstance || secretInstance.isDeleted) {
       throw notFoundError("secret");
     }
 
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: secretInstance.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, secretInstance.projectId);
 
     await assertProjectAccess(ctx, project);
 
@@ -193,9 +280,7 @@ export const getAllSecretsForProject = protectedQuery({
   ): Promise<
     Array<{ id: Id<"secret">; environmentId: Id<"environment">; encryptedValue: string }>
   > => {
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: args.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, args.projectId);
 
     await assertProjectAccess(ctx, project);
 
@@ -225,6 +310,7 @@ export const updateSecretBulk = protectedMutation({
       }),
     ),
     mode: v.optional(v.union(v.literal("skip"), v.literal("overwrite"))),
+    expectedKeyVersion: v.optional(v.number()),
   },
   returns: v.object({
     success: v.boolean(),
@@ -246,6 +332,7 @@ export const updateSecretBulk = protectedMutation({
         scope?: "client" | "server" | "shared";
       }>;
       mode?: "skip" | "overwrite";
+      expectedKeyVersion?: number;
     },
   ) => {
     if (args.secrets.length === 0) {
@@ -263,13 +350,13 @@ export const updateSecretBulk = protectedMutation({
       },
     );
 
-    const project: Doc<"project"> = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: environment.projectId,
-    });
+    const project: Doc<"project"> = await getProjectOrThrow(ctx, environment.projectId);
 
-    await assertProjectAccess(ctx, project);
+    await assertProjectWriteAccess(ctx, project);
 
     await checkRateLimit(ctx, "write");
+
+    assertExpectedKeyVersion(project, args.expectedKeyVersion);
 
     let folder: Doc<"folder"> | undefined;
 
@@ -282,13 +369,7 @@ export const updateSecretBulk = protectedMutation({
         throw notFoundError("folder");
       }
 
-      if (folder.environmentId !== args.environmentId) {
-        throw createError({
-          code: ErrorCode.INVALID_ARGUMENTS,
-          message: "Folder does not belong to this environment",
-          severity: ErrorSeverity.Medium,
-        });
-      }
+      assertFolderInEnvironment(folder, environment);
     }
 
     const mode = args.mode || "skip";
@@ -298,10 +379,7 @@ export const updateSecretBulk = protectedMutation({
     let skippedCount = 0;
 
     // Check current secret count to ensure we don't exceed limit when creating new secrets
-    const existingSecrets = await ctx.runQuery(internal.secret._loadSecretsByEnvironmentId, {
-      environmentId: args.environmentId,
-    });
-    const initialCount = existingSecrets.length;
+    const initialCount = await countActiveSecretsInEnvironment(ctx, args.environmentId);
 
     // Process each secret
     for (const secretInput of args.secrets) {
@@ -344,6 +422,22 @@ export const updateSecretBulk = protectedMutation({
             severity: ErrorSeverity.Medium,
           });
         }
+
+        if (secretInput.key !== secret.key) {
+          const clash = await findActiveSecretByKey(
+            ctx,
+            secret.environmentId,
+            secret.folderId,
+            secretInput.key,
+          );
+          if (clash && clash._id !== secret._id) {
+            if (mode === "skip") {
+              skippedCount++;
+              continue;
+            }
+            alreadyExistsError("secret", ErrorSeverity.Medium);
+          }
+        }
       } else {
         // Load by key
         secret = await ctx.runQuery(internal.secret._loadSecretByKeyAndEnvironmentIdAndFolderId, {
@@ -362,11 +456,7 @@ export const updateSecretBulk = protectedMutation({
               skippedCount++;
               continue;
             }
-            throw createError({
-              code: ErrorCode.ENVIRONMENT_LIMIT_REACHED,
-              message: `Cannot create new secret "${secretInput.key}". Environment already has ${initialCount + createdSecretIds.length} secrets. Maximum ${MAX_SECRETS_PER_ENVIRONMENT} secrets per environment.`,
-              severity: ErrorSeverity.High,
-            });
+            environmentLimitError(initialCount + createdSecretIds.length, secretInput.key);
           }
 
           const { secretId } = await ctx.runMutation(internal.secret._insertSecret, {
@@ -435,6 +525,12 @@ export const updateSecretBulk = protectedMutation({
         continue;
       }
 
+      await ctx.runMutation(internal.secretHistory._recordSecretVersion, {
+        secretId: secret._id,
+        changeType: "updated",
+        changedBy: ctx.userId,
+      });
+
       await ctx.runMutation(internal.secret._updateSecret, {
         secretId: secret._id,
         updates: {
@@ -490,6 +586,7 @@ export const updateSecret = protectedMutation({
       ),
       scope: v.optional(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
     }),
+    expectedKeyVersion: v.optional(v.number()),
     // description: v.optional(v.string()),
     // tags: v.optional(v.array(v.string())),
   },
@@ -503,6 +600,7 @@ export const updateSecret = protectedMutation({
         valueType?: SecretValueType;
         scope?: "client" | "server" | "shared";
       };
+      expectedKeyVersion?: number;
     },
   ) => {
     const secret = await ctx.runQuery(internal.secret._loadSecretById, {
@@ -521,13 +619,28 @@ export const updateSecret = protectedMutation({
       });
     }
 
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: secret.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, secret.projectId);
 
-    await assertProjectAccess(ctx, project);
+    await assertProjectWriteAccess(ctx, project);
 
     await checkRateLimit(ctx, "write");
+
+    assertExpectedKeyVersion(project, args.expectedKeyVersion);
+    await assertRenameAvailable(ctx, secret, args.updates.key);
+    const isChanged =
+      (args.updates.encryptedValue !== undefined &&
+        args.updates.encryptedValue !== secret.encryptedValue) ||
+      (args.updates.key !== undefined && args.updates.key !== secret.key) ||
+      (args.updates.valueType !== undefined && args.updates.valueType !== secret.valueType) ||
+      (args.updates.scope !== undefined && args.updates.scope !== secret.scope);
+
+    if (isChanged) {
+      await ctx.runMutation(internal.secretHistory._recordSecretVersion, {
+        secretId: args.secretId,
+        changeType: "updated",
+        changedBy: ctx.userId,
+      });
+    }
 
     // update secret here, using project's current key version when value is updated
     await ctx.runMutation(internal.secret._updateSecret, {
@@ -595,18 +708,24 @@ export const deleteSecret = protectedMutation({
       });
     }
 
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: secret.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, secret.projectId);
 
-    await assertProjectAccess(ctx, project);
+    await assertProjectWriteAccess(ctx, project);
 
     await checkRateLimit(ctx, "delete");
 
+    await ctx.runMutation(internal.secretHistory._recordSecretVersion, {
+      secretId: args.secretId,
+      changeType: "deleted",
+      changedBy: ctx.userId,
+    });
+
+    // NOTE: secretHistory keeps the restorable copy; ciphertext left here would escape key rotation.
     await ctx.runMutation(internal.secret._updateSecret, {
       secretId: args.secretId,
       updates: {
         isDeleted: true,
+        encryptedValue: "",
         updatedBy: ctx.userId,
       },
     });
@@ -652,6 +771,10 @@ export const _exportSecretsCore = internalMutation({
     folderName: v.optional(v.string()),
     folderId: v.optional(v.id("folder")),
     scope: v.optional(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+    scopes: v.optional(
+      v.array(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+    ),
+    push: v.optional(pushAuditValidator),
   },
   returns: v.object({
     secrets: v.array(
@@ -679,8 +802,12 @@ export const _exportSecretsCore = internalMutation({
       folderName?: string;
       folderId?: Id<"folder">;
       scope?: "client" | "server" | "shared";
+      scopes?: Array<"client" | "server" | "shared">;
+      push?: PushAudit;
     },
   ): Promise<ExportSecretsResult> => {
+    const audit = buildExportAudit(args.push);
+
     if (args.apiKeyId) {
       await checkRateLimit(ctx, "apiKeyExport", `apiKeyExport:${args.apiKeyId}`);
     }
@@ -693,9 +820,7 @@ export const _exportSecretsCore = internalMutation({
     } as unknown as ProtectedMutationCtx;
     await checkRateLimit(authCtx, "read");
 
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: args.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, args.projectId);
 
     await assertProjectAccess(authCtx, project);
 
@@ -771,15 +896,16 @@ export const _exportSecretsCore = internalMutation({
       folderId: resolvedFolderId,
     });
 
-    const filteredSecrets = args.scope
-      ? secrets.filter((secret) => secret.scope === args.scope)
+    const scopeFilter = args.scopes ?? (args.scope ? [args.scope] : undefined);
+    const filteredSecrets = scopeFilter
+      ? secrets.filter((secret) => scopeFilter.includes(secret.scope))
       : secrets;
 
     await ctx.runMutation(internal.actionLog._insertActionLog, {
       projectId: project._id,
       projectName: project.name,
       userId: args.userId,
-      action: "secret.exported",
+      action: audit.action,
       environmentId: resolvedEnvironmentId,
       environmentName: environment.name,
       metadata: {
@@ -787,6 +913,7 @@ export const _exportSecretsCore = internalMutation({
         folderName: folder?.name,
         exportCount: filteredSecrets.length,
         exportFormat: "env",
+        ...audit.metadata,
       },
     });
 
@@ -813,6 +940,10 @@ export const _exportSecretsForServiceAccount = internalMutation({
     environmentName: v.optional(v.string()),
     folderName: v.optional(v.string()),
     scope: v.optional(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+    scopes: v.optional(
+      v.array(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+    ),
+    push: v.optional(pushAuditValidator),
   },
   returns: v.object({
     secrets: v.array(
@@ -836,13 +967,15 @@ export const _exportSecretsForServiceAccount = internalMutation({
       environmentName?: string;
       folderName?: string;
       scope?: "client" | "server" | "shared";
+      scopes?: Array<"client" | "server" | "shared">;
+      push?: PushAudit;
     },
   ): Promise<ServiceAccountExportResult> => {
+    const audit = buildExportAudit(args.push);
+
     await checkRateLimit(ctx, "serviceAccountExport", `saExport:${args.serviceAccountId}`);
 
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: args.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, args.projectId);
 
     if (!args.environmentName) {
       throw createError({
@@ -891,15 +1024,16 @@ export const _exportSecretsForServiceAccount = internalMutation({
       folderId: folderId ?? undefined,
     });
 
-    const filteredSecrets = args.scope
-      ? secrets.filter((secret) => secret.scope === args.scope)
+    const scopeFilter = args.scopes ?? (args.scope ? [args.scope] : undefined);
+    const filteredSecrets = scopeFilter
+      ? secrets.filter((secret) => scopeFilter.includes(secret.scope))
       : secrets;
 
     await ctx.runMutation(internal.actionLog._insertActionLog, {
       projectId: project._id,
       projectName: project.name,
       userId: args.serviceAccountId,
-      action: "secret.exported",
+      action: audit.action,
       environmentId,
       environmentName: environment.name,
       metadata: {
@@ -907,6 +1041,7 @@ export const _exportSecretsForServiceAccount = internalMutation({
         folderName: folder?.name,
         exportCount: filteredSecrets.length,
         exportFormat: "env",
+        ...audit.metadata,
       },
     });
 
@@ -933,12 +1068,158 @@ export const exportSecrets = protectedMutation({
     folderName: v.optional(v.string()),
     folderId: v.optional(v.id("folder")),
     scope: v.optional(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+    scopes: v.optional(
+      v.array(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+    ),
+    push: v.optional(pushAuditValidator),
   },
   handler: async (ctx: ProtectedMutationCtx, args): Promise<ExportSecretsResult> => {
     return await ctx.runMutation(internal.secret._exportSecretsCore, {
       userId: ctx.userId,
       ...args,
     });
+  },
+});
+
+/** Lets HTTP actions turn untrusted id strings into ids, or reject them with a 400. */
+export const _normalizeExportIds = internalQuery({
+  args: {
+    projectId: v.string(),
+    environmentId: v.optional(v.string()),
+    folderId: v.optional(v.string()),
+  },
+  returns: v.union(
+    v.null(),
+    v.object({
+      projectId: v.id("project"),
+      environmentId: v.optional(v.id("environment")),
+      folderId: v.optional(v.id("folder")),
+    }),
+  ),
+  handler: async (ctx, args) => {
+    const projectId = ctx.db.normalizeId("project", args.projectId);
+    const environmentId =
+      args.environmentId === undefined
+        ? undefined
+        : ctx.db.normalizeId("environment", args.environmentId);
+    const folderId =
+      args.folderId === undefined ? undefined : ctx.db.normalizeId("folder", args.folderId);
+
+    if (!projectId || environmentId === null || folderId === null) return null;
+    return { projectId, environmentId, folderId };
+  },
+});
+
+type SecretNamesArgs = {
+  projectId: Id<"project">;
+  environmentName: string;
+  folderName?: string;
+  scope?: "client" | "server" | "shared";
+};
+
+type SecretNamesResult = {
+  secrets: {
+    key: string;
+    scope: "client" | "server" | "shared";
+    valueType: "string" | "number" | "boolean";
+  }[];
+  count: number;
+  environmentId: Id<"environment">;
+  folderId: Id<"folder"> | null;
+};
+
+const secretNamesArgs = {
+  projectId: v.id("project"),
+  environmentName: v.string(),
+  folderName: v.optional(v.string()),
+  scope: v.optional(v.union(v.literal("client"), v.literal("server"), v.literal("shared"))),
+};
+
+const secretNamesResult = v.object({
+  secrets: v.array(
+    v.object({
+      key: v.string(),
+      scope: v.union(v.literal("client"), v.literal("server"), v.literal("shared")),
+      valueType: v.union(v.literal("string"), v.literal("number"), v.literal("boolean")),
+    }),
+  ),
+  count: v.number(),
+  environmentId: v.id("environment"),
+  folderId: v.union(v.id("folder"), v.null()),
+});
+
+async function loadSecretNames(ctx: QueryCtx, args: SecretNamesArgs): Promise<SecretNamesResult> {
+  const { environmentId, folderId } = await ctx.runQuery(
+    internal.secret._loadSecretLocationIdsPair,
+    {
+      projectId: args.projectId,
+      environmentName: args.environmentName,
+      folderName: args.folderName,
+    },
+  );
+
+  const secrets: Doc<"secret">[] = await ctx.runQuery(internal.secret._loadSecrets, {
+    environmentId,
+    projectId: args.projectId,
+    folderId: folderId ?? undefined,
+  });
+
+  const filteredSecrets = args.scope
+    ? secrets.filter((secret) => secret.scope === args.scope)
+    : secrets;
+
+  return {
+    secrets: filteredSecrets.map((s) => ({
+      key: s.key,
+      scope: s.scope,
+      valueType: s.valueType,
+    })),
+    count: filteredSecrets.length,
+    environmentId,
+    folderId,
+  };
+}
+
+export const listSecretNames = protectedQuery({
+  args: secretNamesArgs,
+  returns: secretNamesResult,
+  handler: async (ctx: ProtectedQueryCtx, args: SecretNamesArgs): Promise<SecretNamesResult> => {
+    const project = await getProjectOrThrow(ctx, args.projectId);
+
+    await assertProjectAccess(ctx, project);
+
+    return await loadSecretNames(ctx, args);
+  },
+});
+
+export const _listSecretNamesForUser = internalQuery({
+  args: { userId: v.string(), ...secretNamesArgs },
+  returns: secretNamesResult,
+  handler: async (
+    ctx,
+    { userId, ...args }: SecretNamesArgs & { userId: string },
+  ): Promise<SecretNamesResult> => {
+    const authCtx = {
+      ...ctx,
+      userId,
+      email: undefined,
+      name: undefined,
+    } as unknown as ProtectedQueryCtx;
+
+    const project = await getProjectOrThrow(ctx, args.projectId);
+
+    await assertProjectAccess(authCtx, project);
+
+    return await loadSecretNames(ctx, args);
+  },
+});
+
+// NOTE: callers must validate the service token first; it already pins the project and rejects archived ones.
+export const _listSecretNamesForServiceAccount = internalQuery({
+  args: secretNamesArgs,
+  returns: secretNamesResult,
+  handler: async (ctx, args: SecretNamesArgs): Promise<SecretNamesResult> => {
+    return await loadSecretNames(ctx, args);
   },
 });
 
@@ -1010,13 +1291,11 @@ export const _loadSecrets = internalQuery({
   handler: async (ctx, args) => {
     return await ctx.db
       .query("secret")
-      .withIndex("by_environment", (q) => q.eq("environmentId", args.environmentId))
+      .withIndex("by_env_folder_key", (q) =>
+        q.eq("environmentId", args.environmentId).eq("folderId", args.folderId),
+      )
       .filter((q) =>
-        q.and(
-          q.eq(q.field("projectId"), args.projectId),
-          q.eq(q.field("folderId"), args.folderId),
-          q.eq(q.field("isDeleted"), false),
-        ),
+        q.and(q.eq(q.field("projectId"), args.projectId), q.eq(q.field("isDeleted"), false)),
       )
       .collect();
   },
@@ -1032,19 +1311,7 @@ export const _loadSecretByKeyAndEnvironmentIdAndFolderId = internalQuery({
   handler: async (
     ctx,
     args: { key: string; environmentId: Id<"environment">; folderId?: Id<"folder"> },
-  ) => {
-    const secret = await ctx.db
-      .query("secret")
-      .withIndex("by_env_and_key", (q) =>
-        q.eq("environmentId", args.environmentId).eq("key", args.key),
-      )
-      .filter((q) =>
-        q.and(q.eq(q.field("isDeleted"), false), q.eq(q.field("folderId"), args.folderId)),
-      )
-      .first();
-
-    return secret;
-  },
+  ) => findActiveSecretByKey(ctx, args.environmentId, args.folderId, args.key),
 });
 
 export const _loadSecretsByEnvironmentId = internalQuery({
@@ -1055,8 +1322,9 @@ export const _loadSecretsByEnvironmentId = internalQuery({
   handler: async (ctx, args: { environmentId: Id<"environment"> }) => {
     return await ctx.db
       .query("secret")
-      .withIndex("by_environment", (q) => q.eq("environmentId", args.environmentId))
-      .filter((q) => q.eq(q.field("isDeleted"), false))
+      .withIndex("by_environment_deleted", (q) =>
+        q.eq("environmentId", args.environmentId).eq("isDeleted", false),
+      )
       .collect();
   },
 });
@@ -1083,8 +1351,9 @@ export const _loadSecretsByProjectId = internalQuery({
   handler: async (ctx, args: { projectId: Id<"project"> }) => {
     return await ctx.db
       .query("secret")
-      .withIndex("by_project", (q) => q.eq("projectId", args.projectId))
-      .filter((q) => q.eq(q.field("isDeleted"), false))
+      .withIndex("by_project_deleted", (q) =>
+        q.eq("projectId", args.projectId).eq("isDeleted", false),
+      )
       .collect();
   },
 });
@@ -1182,6 +1451,7 @@ export const _insertSecret = internalMutation({
       // tags: args.tags,
       scope: args.scope,
       isDeleted: false,
+      valueChangedAt: now,
       createdBy: args.createdBy,
       createdAt: now,
       updatedBy: args.createdBy,
@@ -1249,6 +1519,7 @@ export const _updateSecret = internalMutation({
       valueType?: SecretValueType;
       scope?: "client" | "server" | "shared";
       isDeleted?: boolean;
+      valueChangedAt?: number;
       // description?: string;
       // tags?: string[];
     } = {
@@ -1256,9 +1527,24 @@ export const _updateSecret = internalMutation({
       updatedAt: now,
     };
 
+    const existing = await ctx.db.get(args.secretId);
+
     if (args.updates.key !== undefined) updates.key = args.updates.key;
     if (args.updates.encryptedValue !== undefined)
       updates.encryptedValue = args.updates.encryptedValue;
+
+    // Values are opaque here; clients reuse the stored ciphertext when the value is unchanged.
+    if (
+      args.updates.encryptedValue !== undefined &&
+      existing?.encryptedValue !== args.updates.encryptedValue
+    ) {
+      updates.valueChangedAt = now;
+    } else if (existing && existing.valueChangedAt === undefined) {
+      updates.valueChangedAt = inferValueChangedAt(
+        existing,
+        await loadKeyRotationTimestamps(ctx, existing.projectId),
+      );
+    }
     if (args.updates.encryptionKeyVersion !== undefined)
       updates.encryptionKeyVersion = args.updates.encryptionKeyVersion;
     if (args.updates.valueType !== undefined) updates.valueType = args.updates.valueType;
@@ -1325,11 +1611,26 @@ export const _reEncryptSecretsForKeyRotation = internalMutation({
 
     let totalEncrypted = 0;
     const now = Date.now();
+    const keyRotationTimestampsByProject = new Map<Id<"project">, number[]>();
 
     for (const { secretId, newEncryptedValue, newEncryptionKeyVersion } of args.secrets) {
+      const existing = await ctx.db.get(secretId);
+
+      // Re-encryption keeps the plaintext, so pin the value age before updatedAt moves.
+      let valueChangedAt = existing?.valueChangedAt;
+      if (existing && valueChangedAt === undefined) {
+        let keyRotationTimestamps = keyRotationTimestampsByProject.get(existing.projectId);
+        if (!keyRotationTimestamps) {
+          keyRotationTimestamps = await loadKeyRotationTimestamps(ctx, existing.projectId);
+          keyRotationTimestampsByProject.set(existing.projectId, keyRotationTimestamps);
+        }
+        valueChangedAt = inferValueChangedAt(existing, keyRotationTimestamps);
+      }
+
       await ctx.db.patch(secretId, {
         encryptedValue: newEncryptedValue,
         encryptionKeyVersion: newEncryptionKeyVersion,
+        valueChangedAt,
         updatedAt: now,
         updatedBy: args.userId,
       });

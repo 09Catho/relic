@@ -72,18 +72,59 @@ jobs:
   Without OIDC, it can be omitted.
 </Note>
 
+### Check for Missing Keys Before Deploying
+
+Add a [`relic check`](/guides/check) step before the deploy. It fails the job when a key listed in `.env.example` or read in your source code is missing from the environment. It reads secret names only and never decrypts values.
+
+```yaml
+      - name: Check required secrets
+        env:
+          RELIC_SERVICE_TOKEN: ${{ secrets.RELIC_SERVICE_TOKEN }}
+        run: relic check -e production --scan src
+
+      - name: Deploy with secrets
+        env:
+          RELIC_SERVICE_TOKEN: ${{ secrets.RELIC_SERVICE_TOKEN }}
+        run: relic run -e production -- npm run deploy
+```
+
+To keep staging and production in sync, add `--compare` with `--strict` so any difference in key names fails the job:
+
+```bash
+relic check -e staging --compare production --strict
+```
+
 ## GitLab CI
 
 ```yaml
 deploy:
   stage: deploy
   image: oven/bun:latest
+  # Only needed if the service account has an OIDC policy (`--gitlab`).
+  id_tokens:
+    RELIC_OIDC_TOKEN:
+      aud: relic
   script:
     - bun add -g relic
     - relic run -e production -- npm run deploy
   variables:
     RELIC_SERVICE_TOKEN: $RELIC_SERVICE_TOKEN
 ```
+
+<Note>
+  GitHub Actions OIDC tokens are requested automatically. GitLab CI needs the `id_tokens` block
+  above; the `CI_JOB_JWT_V2` variable used by older GitLab versions was removed in GitLab 17.0.
+</Note>
+
+## Environment Variables in the Command
+
+`relic run` starts your command with only the secrets plus a minimal set of variables (`PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TMPDIR`, `TZ`). CI variables such as `CI`, `NODE_ENV`, or `GITHUB_*` are **not** passed through by default. Add `--inherit-env` if your build needs them:
+
+```bash
+relic run -e production --inherit-env -- npm run build
+```
+
+On macOS and Linux, Relic's own variables (`RELIC_SERVICE_TOKEN`, `RELIC_API_KEY`, `RELIC_PASSWORD`, ...) are never passed through, with or without `--inherit-env`.
 
 ## Other Providers
 
@@ -133,6 +174,16 @@ relic run -e production -f web -- npm run build
 ```
 
 Useful in monorepos where different services need different secrets from the same environment.
+
+## Leak Scanning
+
+Run `relic guard` on pull requests to fail the build when a commit adds a dotenv file or the value of one of your secrets:
+
+```bash
+relic guard scan --range "origin/main..HEAD" -e production --require-values
+```
+
+See [Leak Guard](/guides/leak-guard#ci) for a complete GitHub Actions workflow.
 
 ## Security Considerations
 

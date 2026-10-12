@@ -17,11 +17,15 @@ import type {
   ProjectLimits,
   ProjectListItem,
   Secret,
+  SecretHistory,
+  SecretHistoryForRotation,
   SecretScope,
   SecretValueType,
+  ServiceAccount,
   SharedUser,
   ShareLimits,
   ShareProjectResult,
+  UnarchiveProjectResult,
   User,
 } from "./types/api";
 
@@ -61,7 +65,6 @@ export class ProtectedApi {
         logger.debug("Setting auth token:", {
           tokenLength: token.length,
           tokenParts: tokenParts.length,
-          tokenPreview: `${token.substring(0, 20)}...${token.substring(token.length - 20)}`,
         });
         if (tokenParts.length !== 3) {
           throw new Error(`Invalid JWT format before setAuth: ${tokenParts.length} parts`);
@@ -172,7 +175,7 @@ export class ProtectedApi {
     encryptedProjectKey: string;
     confirmPayment?: boolean;
   }): Promise<CreateProjectResult> {
-    return this.withAuth(() => this.client.action(api.project.createProject, args));
+    return await this.withAuth(() => this.client.action(api.project.createProject, args));
   }
 
   async updateProject(args: { projectId: string; name: string }): Promise<void> {
@@ -190,10 +193,20 @@ export class ProtectedApi {
     );
   }
 
-  async unarchiveProject(projectId: string): Promise<void> {
-    await this.withAuth(() =>
-      this.client.action(api.project.unarchiveProject, { projectId: toId<"project">(projectId) }),
+  async unarchiveProject(args: {
+    projectId: string;
+    confirmPayment?: boolean;
+  }): Promise<UnarchiveProjectResult> {
+    const result: unknown = await this.withAuth(() =>
+      this.client.action(api.project.unarchiveProject, {
+        projectId: toId<"project">(args.projectId),
+        confirmPayment: args.confirmPayment,
+      }),
     );
+    if (result && typeof result === "object" && "status" in result) {
+      return result as UnarchiveProjectResult;
+    }
+    return { status: "success" };
   }
 
   async getLimits(): Promise<{ usage: number; includedUsage: number }> {
@@ -313,6 +326,7 @@ export class ProtectedApi {
     valueType?: SecretValueType;
     scope?: SecretScope;
     description?: string;
+    expectedKeyVersion?: number;
   }): Promise<{ id: string }> {
     // Note: description parameter is not supported by backend yet
     const result = await this.withAuth(() =>
@@ -323,6 +337,7 @@ export class ProtectedApi {
         encryptedValue: args.encryptedValue,
         valueType: (args.valueType ?? "string") as "string" | "number" | "boolean",
         scope: args.scope as "client" | "server" | "shared" | undefined,
+        expectedKeyVersion: args.expectedKeyVersion,
       }),
     );
     return { id: String(result.id) };
@@ -339,6 +354,7 @@ export class ProtectedApi {
       scope?: SecretScope;
     }>;
     mode?: "skip" | "overwrite";
+    expectedKeyVersion?: number;
   }): Promise<{
     success: boolean;
     updatedCount: number;
@@ -358,6 +374,7 @@ export class ProtectedApi {
           scope: s.scope as "client" | "server" | "shared" | undefined,
         })),
         mode: args.mode,
+        expectedKeyVersion: args.expectedKeyVersion,
       }),
     );
     return {
@@ -400,6 +417,7 @@ export class ProtectedApi {
     valueType?: SecretValueType;
     scope?: SecretScope;
     description?: string;
+    expectedKeyVersion?: number;
   }): Promise<void> {
     // Note: description parameter is not supported by backend yet
     await this.withAuth(() =>
@@ -411,6 +429,7 @@ export class ProtectedApi {
           valueType: (args.valueType ?? BackendSecretValueType.String) as BackendSecretValueType,
           scope: args.scope as "client" | "server" | "shared" | undefined,
         },
+        expectedKeyVersion: args.expectedKeyVersion,
       }),
     );
   }
@@ -421,13 +440,34 @@ export class ProtectedApi {
     );
   }
 
+  async setSecretRotationPolicy(secretId: string, rotateEveryDays: number | null): Promise<void> {
+    await this.withAuth(() =>
+      this.client.mutation(api.rotation.setSecretRotationPolicy, {
+        secretId: toId<"secret">(secretId),
+        rotateEveryDays,
+      }),
+    );
+  }
+
+  async setEnvironmentRotationPolicy(
+    environmentId: string,
+    rotateEveryDays: number | null,
+  ): Promise<void> {
+    await this.withAuth(() =>
+      this.client.mutation(api.rotation.setEnvironmentRotationPolicy, {
+        environmentId: toId<"environment">(environmentId),
+        rotateEveryDays,
+      }),
+    );
+  }
+
   async shareProject(args: {
     projectId: string;
     userEmail: string;
     encryptedProjectKey: string;
     confirmPayment?: boolean;
   }): Promise<ShareProjectResult> {
-    return this.withAuth(() =>
+    const result: unknown = await this.withAuth(() =>
       this.client.action(api.projectShare.shareProject, {
         projectId: toId<"project">(args.projectId),
         userEmail: args.userEmail,
@@ -435,6 +475,7 @@ export class ProtectedApi {
         confirmPayment: args.confirmPayment,
       }),
     );
+    return result as ShareProjectResult;
   }
 
   async revokeShare(shareId: string): Promise<void> {
@@ -490,6 +531,8 @@ export class ProtectedApi {
     newEncryptedProjectKey: string;
     rewrappedShares: Array<{ shareId: string; newEncryptedProjectKey: string }>;
     reEncryptedSecrets: Array<{ secretId: string; newEncryptedValue: string }>;
+    rewrappedServiceAccounts: Array<{ serviceAccountId: string; newEncryptedProjectKey: string }>;
+    reEncryptedHistory: Array<{ historyId: string; newEncryptedValue: string }>;
   }): Promise<void> {
     await this.withAuth(() =>
       this.client.action(api.projectShare.revokeShareWithRotation, {
@@ -503,13 +546,95 @@ export class ProtectedApi {
           secretId: toId<"secret">(s.secretId),
           newEncryptedValue: s.newEncryptedValue,
         })),
+        rewrappedServiceAccounts: args.rewrappedServiceAccounts.map((s) => ({
+          serviceAccountId: toId<"serviceAccount">(s.serviceAccountId),
+          newEncryptedProjectKey: s.newEncryptedProjectKey,
+        })),
+        reEncryptedHistory: args.reEncryptedHistory.map((h) => ({
+          historyId: toId<"secretHistory">(h.historyId),
+          newEncryptedValue: h.newEncryptedValue,
+        })),
       }),
     );
   }
 
-  async getProPlan(): Promise<{ url: string }> {
+  async listServiceAccounts(projectId: string): Promise<ServiceAccount[]> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.serviceAccount.listServiceAccounts, {
+        projectId: toId<"project">(projectId),
+      }),
+    );
+    return result.map((sa) => ({
+      id: String(sa.id),
+      name: sa.name,
+      publicKey: sa.publicKey,
+      revokedAt: sa.revokedAt,
+    }));
+  }
+
+  async getSecretHistory(secretId: string): Promise<SecretHistory> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.secretHistory.getSecretHistory, {
+        secretId: toId<"secret">(secretId),
+      }),
+    );
+    return {
+      secretId: String(result.secret.id),
+      key: result.secret.key,
+      isDeleted: result.secret.isDeleted,
+      currentVersion: result.secret.currentVersion,
+      encryptedValue: result.secret.encryptedValue,
+      updatedByEmail: result.secret.updatedByEmail,
+      updatedAt: result.secret.updatedAt,
+      versions: result.versions.map((entry) => ({
+        id: String(entry.id),
+        version: entry.version,
+        key: entry.key,
+        encryptedValue: entry.encryptedValue,
+        valueType: entry.valueType,
+        scope: entry.scope,
+        changeType: entry.changeType,
+        changedBy: entry.changedBy,
+        changedByEmail: entry.changedByEmail,
+        changedAt: entry.changedAt,
+      })),
+      encryptedProjectKey: result.encryptedProjectKey,
+      retentionLimit: result.retentionLimit,
+    };
+  }
+
+  async restoreSecretVersion(secretId: string, version: number): Promise<void> {
+    await this.withAuth(() =>
+      this.client.mutation(api.secretHistory.restoreSecretVersion, {
+        secretId: toId<"secret">(secretId),
+        version,
+      }),
+    );
+  }
+
+  async getAllSecretHistoryForProject(projectId: string): Promise<SecretHistoryForRotation[]> {
+    const entries: SecretHistoryForRotation[] = [];
+    let cursor: string | null = null;
+    let isDone = false;
+    while (!isDone) {
+      const result = await this.withAuth(() =>
+        this.client.query(api.secretHistory.getSecretHistoryForRotation, {
+          projectId: toId<"project">(projectId),
+          paginationOpts: { numItems: 500, cursor },
+        }),
+      );
+      for (const entry of result.page) {
+        entries.push({ id: String(entry.id), encryptedValue: entry.encryptedValue });
+      }
+      cursor = result.continueCursor;
+      isDone = result.isDone;
+    }
+    return entries;
+  }
+
+  async getProPlan(): Promise<{ url: string; hasPro: boolean }> {
     const result = await this.withAuth(() => this.client.action(api.user.getProPlan, {}));
-    return { url: result.checkoutLink ?? "" };
+    return { url: result.checkoutLink ?? "", hasPro: result.hasPro };
   }
 
   async checkProPlan(): Promise<{ hasPro: boolean }> {

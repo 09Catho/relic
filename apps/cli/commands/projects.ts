@@ -1,13 +1,17 @@
-import { validateSession } from "@repo/auth";
 import { trackEvent } from "@repo/logger";
 import ora from "ora";
 import pc from "picocolors";
-import { type Environment, type Folder, getApi, type ProjectListItem } from "../lib/api";
-
-interface ProjectWithDetails extends ProjectListItem {
-  isShared: boolean;
-  environments: Array<Environment & { folders: Folder[] }>;
-}
+import { getApi } from "../lib/api";
+import {
+  getErrorMessage,
+  hasActiveSession,
+  isAuthError,
+  NOT_LOGGED_IN_MESSAGE,
+  printNotLoggedIn,
+} from "../lib/cli";
+import { printJson, printJsonError } from "../lib/json";
+import { loadProjectTree, type ProjectWithDetails } from "../lib/projects";
+import { exitWithTelemetry } from "../lib/telemetry";
 
 const TREE = {
   BRANCH: "├── ",
@@ -19,7 +23,7 @@ const TREE = {
 function renderProjectTree(projects: ProjectWithDetails[]): void {
   if (projects.length === 0) {
     console.log(pc.dim("No projects found"));
-    console.log(pc.dim("Create one at https://withrelic.com"));
+    console.log(pc.dim("Run `relic` to open the TUI and create a project"));
     return;
   }
 
@@ -67,88 +71,80 @@ function renderProjectTree(projects: ProjectWithDetails[]): void {
   }
 }
 
-export default async function projects() {
-  const spinner = ora("Connecting...").start();
+export interface ProjectsOptions {
+  json?: boolean;
+  project?: string;
+}
+
+export function toProjectsJson(projects: ProjectWithDetails[]) {
+  return projects.map((project) => ({
+    id: project.id,
+    name: project.name,
+    slug: project.slug,
+    isShared: project.isShared,
+    isArchived: project.isArchived,
+    environments: project.environments.map((env) => ({
+      id: env.id,
+      name: env.name,
+      color: env.color ?? null,
+      folders: env.folders.map((folder) => ({ id: folder.id, name: folder.name })),
+    })),
+  }));
+}
+
+export default async function projects(options: ProjectsOptions = {}) {
+  const json = !!options.json;
+  const spinner = json ? null : ora("Connecting...").start();
+
+  const notLoggedIn = async (): Promise<never> => {
+    if (json) {
+      printJsonError("not_logged_in", NOT_LOGGED_IN_MESSAGE);
+    } else {
+      spinner?.stop();
+      printNotLoggedIn();
+    }
+    return exitWithTelemetry(1);
+  };
 
   try {
-    const sessionValidation = await validateSession();
-    if (!sessionValidation.isValid || sessionValidation.isExpired) {
-      spinner.stop();
-      console.log(pc.yellow("Not logged in"));
-      console.log(pc.dim("Run `relic login` to authenticate"));
-      return;
+    if (!(await hasActiveSession())) {
+      await notLoggedIn();
     }
 
-    const api = getApi();
-
-    spinner.text = "Fetching projects...";
-    const [ownedProjects, sharedProjects] = await Promise.all([
-      api.listProjects(),
-      api.listSharedProjects(),
-    ]);
-
-    const allProjects: ProjectWithDetails[] = [
-      ...ownedProjects.map((p) => ({
-        ...p,
-        isShared: false,
-        environments: [] as Array<Environment & { folders: Folder[] }>,
-      })),
-      ...sharedProjects.map((p) => ({
-        ...p,
-        isShared: true,
-        environments: [] as Array<Environment & { folders: Folder[] }>,
-      })),
-    ];
-
-    spinner.text = "Fetching environments...";
-    const projectsWithEnvs = await Promise.all(
-      allProjects.map(async (project) => {
-        try {
-          const environments = await api.getProjectEnvironments(project.id);
-          return {
-            ...project,
-            environments: environments.map((e) => ({ ...e, folders: [] as Folder[] })),
-          };
-        } catch {
-          return { ...project, environments: [] };
+    if (spinner) spinner.text = "Fetching projects...";
+    const projectTree = await loadProjectTree(
+      getApi(),
+      (stage) => {
+        if (spinner) {
+          spinner.text =
+            stage === "environments" ? "Fetching environments..." : "Fetching folders...";
         }
-      }),
+      },
+      options.project,
     );
 
-    spinner.text = "Fetching folders...";
-    const projectsWithFolders = await Promise.all(
-      projectsWithEnvs.map(async (project) => {
-        const environmentsWithFolders = await Promise.all(
-          project.environments.map(async (env) => {
-            try {
-              const data = await api.getEnvironmentData(env.id);
-              return { ...env, folders: data.folders };
-            } catch {
-              return { ...env, folders: [] };
-            }
-          }),
-        );
-        return { ...project, environments: environmentsWithFolders };
-      }),
-    );
+    trackEvent("cli_command_executed", { command: "projects", count: projectTree.length, json });
+    spinner?.stop();
 
-    trackEvent("cli_command_executed", { command: "projects", count: projectsWithFolders.length });
-    spinner.stop();
-    renderProjectTree(projectsWithFolders);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Failed to fetch projects";
-    // Handle auth-related errors more gracefully
-    if (
-      message.includes("Not authenticated") ||
-      message.includes("JWT") ||
-      message.includes("token")
-    ) {
-      spinner.stop();
-      console.log(pc.yellow("Not logged in"));
-      console.log(pc.dim("Run `relic login` to authenticate"));
+    if (json) {
+      if (options.project && projectTree.length === 0) {
+        printJsonError("project_not_found", `Project "${options.project}" not found`);
+        return exitWithTelemetry(1);
+      }
+      printJson(toProjectsJson(projectTree));
       return;
     }
-    spinner.fail(pc.red(`Error: ${message}`));
-    process.exit(1);
+    renderProjectTree(projectTree);
+  } catch (err) {
+    if (isAuthError(err)) {
+      return notLoggedIn();
+    }
+    const message = getErrorMessage(err, "Failed to fetch projects");
+    if (json) {
+      printJsonError("failed", message);
+    } else {
+      spinner?.fail(pc.red(`Error: ${message}`));
+    }
+    await exitWithTelemetry(1);
   }
 }

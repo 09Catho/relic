@@ -15,6 +15,10 @@ When you share a project:
 
 The collaborator can now decrypt the project key with their own private key and access all secrets in the project.
 
+## What Collaborators Can Do
+
+Shared projects are read-only for collaborators. They can browse environments and folders, reveal values, view secret history and rotation status, and use secrets with `relic run` and `relic shell`. Only the owner can create, rename, or delete environments, folders, and secrets, import secrets, roll back to an earlier version, set rotation policies, and manage collaborators.
+
 <Note>
   Both users must have completed the password setup (encryption keys generated) before sharing is
   possible.
@@ -96,11 +100,13 @@ Only the project owner can manage collaborators and archive the project.
 
 ## Limits
 
-| Plan | Shares per project                       |
-| ---- | ---------------------------------------- |
-| Free | Not available                            |
-| Pro  | 5 included, additional shares at $5 each |
+| Plan        | Projects                                   | Shares per project                       |
+| ----------- | ------------------------------------------ | ---------------------------------------- |
+| Free        | 1                                          | Not available                            |
+| Pro ($9/mo) | 5 included, additional projects at $2 each | 5 included, additional shares at $1 each |
 
-Sharing requires the Pro plan. If you exceed the included shares, the TUI will prompt you to confirm the additional cost before proceeding.
+Sharing requires the Pro plan. If you go beyond the included projects or shares, the TUI asks you to confirm the additional cost before proceeding.
+
+If a Pro subscription ends, you get a 7-day grace period. After that, collaborators keep access only to your newest project until you upgrade again or archive the others.
 
 See [Security & Encryption](/configuration/security) for the full cryptographic details of how project sharing works.

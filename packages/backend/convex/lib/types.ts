@@ -1,25 +1,15 @@
-import type { Autumn } from "@useautumn/convex";
 import type { ActionCtx, MutationCtx, QueryCtx } from "../_generated/server";
 import type { Id as BetterAuthId } from "../betterAuth/_generated/dataModel";
 
-export type ProtectedQueryCtx = QueryCtx & {
+type IdentityFields = {
   userId: BetterAuthId<"user">;
   email: string | undefined;
   name: string | undefined;
 };
 
-export type ProtectedMutationCtx = MutationCtx & {
-  userId: BetterAuthId<"user">;
-  email: string | undefined;
-  name: string | undefined;
-};
-
-export type ProtectedActionCtx = ActionCtx & {
-  autumn: Autumn;
-  userId: BetterAuthId<"user">;
-  email: string | undefined;
-  name: string | undefined;
-};
+export type ProtectedQueryCtx = QueryCtx & IdentityFields;
+export type ProtectedMutationCtx = MutationCtx & IdentityFields;
+export type ProtectedActionCtx = ActionCtx & IdentityFields;
 
 export enum ApiKeyScope {
   SecretsRead = "secrets.read",
@@ -58,5 +48,6 @@ export enum EmailKind {
   CollaboratorAdded = "collaborator-added",
   GracePeriodStarted = "grace-period-started",
   PlanUpgraded = "plan-upgraded",
+  RotationDigest = "rotation-digest",
   Welcome = "welcome",
 }

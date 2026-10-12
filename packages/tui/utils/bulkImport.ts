@@ -1,24 +1,12 @@
-export interface BulkImportSecret {
-  key: string;
-  value: string | number | boolean;
-  type: "string" | "number" | "boolean";
-  scope?: string;
-  folder?: string;
-  secretId?: string;
-}
+import { type BulkImportSecret, detectType } from "@repo/bulk-import";
 
-export interface ValidationError {
-  index?: number;
-  field?: string;
-  message: string;
-}
-
-export interface ValidationResult {
-  valid: boolean;
-  secrets: BulkImportSecret[];
-  errors: ValidationError[];
-  duplicateKeys: string[];
-}
+export {
+  type BulkImportSecret,
+  detectType,
+  type ValidationError,
+  type ValidationResult,
+  validateBulkImportJson,
+} from "@repo/bulk-import";
 
 export type CollisionAction = "skip" | "overwrite" | "cancel";
 
@@ -29,67 +17,88 @@ export interface CollisionInfo {
 
 export type BulkImportFormat = "env" | "json";
 
-const BOOLEAN_VALUES = new Set(["true", "false"]);
+export type SecretType = BulkImportSecret["type"];
 
-function detectType(value: string): "string" | "number" | "boolean" {
-  const trimmed = value.trim().toLowerCase();
-  if (BOOLEAN_VALUES.has(trimmed)) return "boolean";
-  if (trimmed !== "" && !Number.isNaN(Number(trimmed)) && Number.isFinite(Number(trimmed))) {
-    return "number";
-  }
-  return "string";
+/** Keeps a known type while the value still fits it; unknown keys fall back to detection. */
+export function resolveType(value: string, knownType?: SecretType): SecretType {
+  if (!knownType) return detectType(value);
+  if (knownType === "string") return "string";
+  return detectType(value) === knownType ? knownType : "string";
 }
 
-function stripQuotes(value: string): string {
-  const trimmed = value.trim();
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
+const ESCAPES: Record<string, string> = { n: "\n", r: "\r", '"': '"', "\\": "\\" };
+
+function unescapeDoubleQuoted(value: string): string {
+  return value.replace(/\\([nr"\\])/g, (_, char: string) => ESCAPES[char] ?? char);
 }
 
-export function parseEnvContent(content: string): BulkImportSecret[] {
+function escapeDoubleQuoted(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r");
+}
+
+function findClosingQuote(text: string, from: number): number {
+  for (let i = from; i < text.length; i++) {
+    if (text[i] === "\\") i++;
+    else if (text[i] === '"') return i;
+  }
+  return -1;
+}
+
+export function formatEnvValue(value: string): string {
+  return /[\s#"']/.test(value) ? `"${escapeDoubleQuoted(value)}"` : value;
+}
+
+export function parseEnvContent(
+  content: string,
+  knownTypes?: ReadonlyMap<string, SecretType>,
+): BulkImportSecret[] {
   const secrets: BulkImportSecret[] = [];
   const lines = content.split("\n");
 
-  for (const line of lines) {
-    const trimmed = line.trim();
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = (lines[i] ?? "").trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
 
     const eqIndex = trimmed.indexOf("=");
     if (eqIndex === -1) continue;
 
     const key = trimmed.slice(0, eqIndex).trim();
-    const rawValue = trimmed.slice(eqIndex + 1);
-    const value = stripQuotes(rawValue);
-
     if (key === "") continue;
 
-    const type = detectType(value);
-    secrets.push({ key, value, type });
+    const rawValue = trimmed.slice(eqIndex + 1).trim();
+    let value: string;
+
+    if (rawValue.startsWith('"')) {
+      let quoted = rawValue;
+      let closing = findClosingQuote(quoted, 1);
+      while (closing === -1 && i + 1 < lines.length) {
+        i++;
+        quoted += `\n${lines[i] ?? ""}`;
+        closing = findClosingQuote(quoted, 1);
+      }
+      value = unescapeDoubleQuoted(quoted.slice(1, closing === -1 ? undefined : closing));
+    } else if (rawValue.startsWith("'") && rawValue.length > 1 && rawValue.endsWith("'")) {
+      value = rawValue.slice(1, -1);
+    } else {
+      value = rawValue;
+    }
+
+    secrets.push({ key, value, type: resolveType(value, knownTypes?.get(key)) });
   }
 
   return secrets;
 }
 
-export function isEnvFormat(content: string): boolean {
-  const trimmed = content.trim();
-  if (trimmed.startsWith("[") || trimmed.startsWith("{")) return false;
-
-  const lines = trimmed.split("\n");
-  for (const line of lines) {
-    const l = line.trim();
-    if (l === "" || l.startsWith("#")) continue;
-    if (l.match(/^[A-Za-z_][A-Za-z0-9_]*=/)) return true;
-  }
-  return false;
-}
-
-export function envToJson(envContent: string, scopeMap?: Map<string, string>): string {
-  const secrets = parseEnvContent(envContent).map((s) => ({
+export function envToJson(
+  envContent: string,
+  scopeMap?: ReadonlyMap<string, string>,
+  knownTypes?: ReadonlyMap<string, SecretType>,
+): string {
+  const secrets = parseEnvContent(envContent, knownTypes).map((s) => ({
     key: s.key,
     value: s.value,
     type: s.type,
@@ -120,9 +129,7 @@ export function jsonToEnv(jsonContent: string): string {
           const value = item.value !== null && item.value !== undefined ? String(item.value) : "";
           if (key === "" && value === "") continue;
 
-          const needsQuotes = /[\s#"']/.test(value);
-          const quotedValue = needsQuotes ? `"${value}"` : value;
-          lines.push(`${key}=${quotedValue}`);
+          lines.push(`${key}=${formatEnvValue(value)}`);
         }
       }
     }
@@ -132,184 +139,16 @@ export function jsonToEnv(jsonContent: string): string {
   }
 }
 
-export function detectFormat(content: string): "env" | "json" | "unknown" {
-  const trimmed = content.trim();
-  if (trimmed === "") return "unknown";
-
-  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
-    try {
-      JSON.parse(trimmed);
-      return "json";
-    } catch {
-      return "unknown";
-    }
-  }
-
-  const lines = trimmed.split("\n");
-  for (const line of lines) {
-    const l = line.trim();
-    if (l === "" || l.startsWith("#")) continue;
-    if (l.match(/^[A-Za-z_][A-Za-z0-9_]*=/)) return "env";
-  }
-
-  return "unknown";
-}
-
-const MAX_KEY_LENGTH = 100;
-const MAX_VALUE_LENGTH = 10000;
-const VALID_TYPES = new Set(["string", "number", "boolean"]);
-const VALID_SCOPES = new Set(["client", "server", "shared"]);
-
-function isValidKey(key: unknown): key is string {
-  return (
-    typeof key === "string" &&
-    key.length > 0 &&
-    key.length <= MAX_KEY_LENGTH &&
-    /^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
-  );
-}
-
-function isValidValue(value: unknown): boolean {
-  if (typeof value === "string") {
-    return value.length <= MAX_VALUE_LENGTH;
-  }
-  return typeof value === "number" || typeof value === "boolean";
-}
-
-function isValidType(type: unknown): type is "string" | "number" | "boolean" {
-  return typeof type === "string" && VALID_TYPES.has(type);
-}
-
-function isValidScope(scope: unknown): scope is "client" | "server" | "shared" {
-  return typeof scope === "string" && VALID_SCOPES.has(scope);
-}
-
-export function validateBulkImportJson(data: unknown): ValidationResult {
-  const errors: ValidationError[] = [];
-  const secrets: BulkImportSecret[] = [];
-  const seenKeys = new Set<string>();
-  const duplicateKeys: string[] = [];
-
-  if (!Array.isArray(data)) {
-    return {
-      valid: false,
-      secrets: [],
-      errors: [{ message: "Expected an array of secrets" }],
-      duplicateKeys: [],
-    };
-  }
-
-  if (data.length === 0) {
-    return {
-      valid: false,
-      secrets: [],
-      errors: [{ message: "No secrets to import" }],
-      duplicateKeys: [],
-    };
-  }
-
-  const arrayData = data;
-
-  for (let i = 0; i < arrayData.length; i++) {
-    const item = arrayData[i];
-
-    if (typeof item !== "object" || item === null) {
-      errors.push({ index: i, message: "Item must be an object" });
-      continue;
-    }
-
-    if (!("key" in item) || typeof item.key !== "string") {
-      errors.push({
-        index: i,
-        field: "key",
-        message: "Missing or invalid key",
-      });
-      continue;
-    }
-
-    if (item.key.trim() === "") {
-      errors.push({
-        index: i,
-        field: "key",
-        message: "Key cannot be empty",
-      });
-      continue;
-    }
-
-    if (!isValidKey(item.key)) {
-      errors.push({
-        index: i,
-        field: "key",
-        message: `Invalid key: must contain only letters, numbers, and underscores (1-${MAX_KEY_LENGTH} chars)`,
-      });
-      continue;
-    }
-
-    if (!("value" in item)) {
-      errors.push({ index: i, field: "value", message: "Missing value" });
-      continue;
-    }
-
-    if (!isValidValue(item.value)) {
-      errors.push({
-        index: i,
-        field: "value",
-        message: `Invalid value: string must be <=${MAX_VALUE_LENGTH} chars, or use number/boolean`,
-      });
-      continue;
-    }
-
-    const key = item.key as string;
-    if (seenKeys.has(key)) {
-      if (!duplicateKeys.includes(key)) {
-        duplicateKeys.push(key);
-      }
-      errors.push({ index: i, field: "key", message: `Duplicate key: ${key}` });
-      continue;
-    }
-    seenKeys.add(key);
-
-    if ("type" in item && !isValidType(item.type)) {
-      errors.push({
-        index: i,
-        field: "type",
-        message: "Invalid type: must be string, number, or boolean",
-      });
-      continue;
-    }
-
-    let type: "string" | "number" | "boolean";
-    if ("type" in item && isValidType(item.type)) {
-      type = item.type;
-    } else {
-      type =
-        typeof item.value === "boolean"
-          ? "boolean"
-          : typeof item.value === "number"
-            ? "number"
-            : "string";
-    }
-
-    let scope: "client" | "server" | "shared" = "shared";
-    if ("scope" in item && isValidScope(item.scope)) {
-      scope = item.scope;
-    }
-
-    secrets.push({
-      key,
-      value: item.value as string | number | boolean,
-      type,
-      scope,
-      secretId: "secretId" in item && typeof item.secretId === "string" ? item.secretId : undefined,
-    });
-  }
-
-  return {
-    valid: errors.length === 0 && secrets.length > 0,
-    secrets,
-    errors,
-    duplicateKeys,
-  };
+/** Secrets the editor would overwrite without the user having loaded them into the editor. */
+export function findCollisions(
+  editorKeys: string[],
+  existingSecrets: ReadonlyArray<{ id: string; key: string }>,
+  prefilledSecretIds: ReadonlySet<string>,
+): CollisionInfo[] {
+  const keys = new Set(editorKeys);
+  return existingSecrets
+    .filter((s) => keys.has(s.key) && !prefilledSecretIds.has(s.id))
+    .map((s) => ({ key: s.key, existingSecretId: s.id }));
 }
 
 export function computeRemovedKeys(existingKeys: string[], editorKeys: string[]): string[] {

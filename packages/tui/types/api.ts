@@ -75,6 +75,7 @@ export interface Environment {
   description?: string;
   color?: string;
   sortOrder: number;
+  rotateEveryDays?: number;
   createdBy: string;
   createdAt: number;
   updatedAt: number;
@@ -110,10 +111,45 @@ export interface Secret {
   encryptionKeyVersion: number;
   tags?: string[];
   isDeleted: boolean;
+  valueChangedAt?: number;
+  rotateEveryDays?: number;
   createdBy: string;
   createdAt: number;
   updatedBy: string;
   updatedAt: number;
+}
+
+export type SecretChangeType = "updated" | "deleted" | "restored";
+
+export interface SecretVersion {
+  id: string;
+  version: number;
+  key: string;
+  encryptedValue: string;
+  valueType: SecretValueType;
+  scope: SecretScope;
+  changeType: SecretChangeType;
+  changedBy: string;
+  changedByEmail: string | null;
+  changedAt: number;
+}
+
+export interface SecretHistory {
+  secretId: string;
+  key: string;
+  isDeleted: boolean;
+  currentVersion: number | null;
+  encryptedValue: string | null;
+  updatedByEmail: string | null;
+  updatedAt: number;
+  versions: SecretVersion[];
+  encryptedProjectKey: string;
+  retentionLimit: number;
+}
+
+export interface SecretHistoryForRotation {
+  id: string;
+  encryptedValue: string;
 }
 
 export interface EnvironmentData {
@@ -140,23 +176,25 @@ export interface SharedUser {
   sharedAt: number;
 }
 
-export interface ShareProjectResult {
-  success: boolean;
-  shareId?: string;
-  requiresProPlan?: boolean;
-  requiresAdditionalShare?: boolean;
-  requiresConfirmation?: boolean;
-  requiresRemoval?: boolean;
-  currentUsage?: number;
-  includedUsage?: number;
-  excessCount?: number;
-  balance?: number;
-  freeLimit?: number;
-  paymentFailed?: boolean;
-  checkoutUrl?: string | null;
-  billingPortalUrl?: string | null;
-  message?: string;
+export interface ServiceAccount {
+  id: string;
+  name: string;
+  publicKey: string;
+  revokedAt?: number;
 }
+
+export type ShareProjectResult =
+  | { success: true; shareId: string }
+  | { success: false; requiresProPlan: true; checkoutUrl: string | null; message: string }
+  | { success: false; requiresConfirmation: true; freeLimit: number; message: string }
+  | { success: false; message: string }
+  | { status: "success"; shareId?: string; message?: string }
+  | { status: "requiresProPlan"; checkoutUrl: string | null; message?: string }
+  | { status: "requiresConfirmation"; freeLimit?: number; balance?: number; message?: string };
+
+export type UnarchiveProjectResult =
+  | { status: "success"; message?: string }
+  | { status: "requiresConfirmation"; freeLimit: number; balance: number; message?: string };
 
 export interface ShareLimits {
   hasPro: boolean;
@@ -173,11 +211,6 @@ export type CreateProjectResult =
       message?: string;
     }
   | {
-      status: "paymentFailed";
-      billingPortalUrl: string | null;
-      message?: string;
-    }
-  | {
       status: "requiresProPlan";
       checkoutUrl: string | null;
       message?: string;
@@ -186,13 +219,6 @@ export type CreateProjectResult =
       status: "requiresConfirmation";
       balance: number;
       freeLimit: number;
-      message?: string;
-    }
-  | {
-      status: "requiresRemoval";
-      currentUsage: number;
-      includedUsage: number;
-      excessCount: number;
       message?: string;
     };
 

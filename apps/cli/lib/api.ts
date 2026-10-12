@@ -1,7 +1,51 @@
 import { CONVEX_SITE_URL, CONVEX_URL, ensureValidJwt, SITE_URL } from "@repo/auth";
-import { api, type Id, type TableNames } from "@repo/backend";
-import { trackError } from "@repo/logger";
+import {
+  api,
+  type Id,
+  type RotationPolicySource,
+  type RotationStatus,
+  type TableNames,
+} from "@repo/backend";
 import { ConvexHttpClient } from "convex/browser";
+import { trackCliError } from "./telemetry";
+import type { SecretScope } from "./types";
+
+export const UPGRADE_URL = `${SITE_URL}/dashboard?action=upgrade`;
+
+export const REQUEST_TIMEOUT_MS = 30_000;
+
+export class NetworkError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "NetworkError";
+  }
+}
+
+function toNetworkError(err: unknown): NetworkError {
+  const name = err instanceof Error ? err.name : "";
+  if (name === "TimeoutError") {
+    return new NetworkError(
+      `Couldn't reach Relic (request timed out after ${REQUEST_TIMEOUT_MS / 1000}s).`,
+      { cause: err },
+    );
+  }
+  return new NetworkError("Couldn't reach Relic (network error).", { cause: err });
+}
+
+/** `fetch` with a hard timeout; transport failures become a `NetworkError`. */
+export async function fetchWithTimeout(
+  input: string | URL | Request,
+  init: RequestInit = {},
+): Promise<Response> {
+  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+  try {
+    return await fetch(input, { ...init, signal });
+  } catch (err) {
+    if (init.signal?.aborted) throw err;
+    throw toNetworkError(err);
+  }
+}
 
 export interface User {
   id: string;
@@ -26,8 +70,33 @@ export interface ProjectListItem {
 export interface Environment {
   id: string;
   name: string;
+  slug?: string;
   projectId: string;
   color?: string;
+  rotateEveryDays?: number;
+}
+
+export interface SecretRotationEntry {
+  secretId: string;
+  key: string;
+  environmentId: string;
+  environmentName: string;
+  folderId: string | null;
+  folderName: string | null;
+  valueChangedAt: number;
+  ageDays: number;
+  rotateEveryDays: number | null;
+  policySource: RotationPolicySource | null;
+  status: RotationStatus;
+  dueAt: number | null;
+  daysUntilDue: number | null;
+}
+
+export interface ProjectRotationStatus {
+  projectId: string;
+  projectName: string;
+  generatedAt: number;
+  secrets: SecretRotationEntry[];
 }
 
 export interface Folder {
@@ -43,14 +112,14 @@ export interface Secret {
   environmentId: string;
   folderId?: string;
   valueType: "string" | "number" | "boolean";
-  scope: "client" | "server" | "shared";
+  scope: SecretScope;
 }
 
 export interface SecretData {
   id: string;
   key: string;
   encryptedValue: string;
-  scope: "client" | "server" | "shared";
+  scope: SecretScope;
   valueType: "string" | "number" | "boolean";
 }
 
@@ -66,6 +135,71 @@ export interface Project {
   encryptedProjectKey: string;
   keyVersion: number;
   isArchived: boolean;
+  ownerId: string;
+}
+
+export interface BulkSecretInput {
+  secretId?: string;
+  key: string;
+  encryptedValue: string;
+  valueType: "string" | "number" | "boolean";
+  scope?: "client" | "server" | "shared";
+}
+
+export interface BulkUpdateResult {
+  success: boolean;
+  updatedCount: number;
+  createdCount: number;
+  skippedCount: number;
+  secretIds: string[];
+}
+
+export interface SecretNamesRequest {
+  environmentName: string;
+  folderName?: string;
+  scope?: SecretScope;
+}
+
+export interface SecretNames {
+  secrets: {
+    key: string;
+    scope: SecretScope;
+    valueType: "string" | "number" | "boolean";
+  }[];
+  count: number;
+}
+
+export type SecretChangeType = "updated" | "deleted" | "restored";
+
+export interface SecretHistoryVersion {
+  id: string;
+  version: number;
+  key: string;
+  encryptedValue: string;
+  valueType: "string" | "number" | "boolean";
+  scope: "client" | "server" | "shared";
+  changeType: SecretChangeType;
+  changedBy: string;
+  changedByEmail: string | null;
+  changedAt: number;
+}
+
+export interface SecretHistory {
+  secret: {
+    id: string;
+    key: string;
+    isDeleted: boolean;
+    currentVersion: number | null;
+    encryptedValue: string | null;
+    valueType: "string" | "number" | "boolean";
+    scope: "client" | "server" | "shared";
+    updatedBy: string;
+    updatedByEmail: string | null;
+    updatedAt: number;
+  };
+  versions: SecretHistoryVersion[];
+  encryptedProjectKey: string;
+  retentionLimit: number;
 }
 
 export interface FullUser extends User {
@@ -75,21 +209,47 @@ export interface FullUser extends User {
   keysUpdatedAt?: number;
 }
 
-function createClient(): ConvexHttpClient {
-  return new ConvexHttpClient(CONVEX_URL);
+export interface ServiceAccount {
+  id: string;
+  name: string;
+  publicKey: string;
+  tokenPrefix: string;
+  oidcIssuer?: string;
+  oidcSubjectPattern?: string;
+  oidcAudience?: string;
+  expiresAt?: number;
+  revokedAt?: number;
+  lastUsedAt?: number;
+  createdAt: number;
+}
+
+export interface ExportSecretsResult {
+  secrets: SecretData[];
+  count: number;
+  encryptedProjectKey: string;
+  environmentId: string;
+  folderId: string | null;
+}
+
+export interface PushAuditInfo {
+  target: string;
+  destination?: string;
+  dryRun?: boolean;
 }
 
 function toId<T extends TableNames>(id: string): Id<T> {
   return id as Id<T>;
 }
 
-export class ProtectedApi {
-  private client: ConvexHttpClient;
-  private authPromise: Promise<void> | null = null;
+function toOptionalId<T extends TableNames>(id: string | undefined): Id<T> | undefined {
+  return id ? toId<T>(id) : undefined;
+}
 
-  constructor() {
-    this.client = createClient();
-  }
+export class ProtectedApi {
+  private client = new ConvexHttpClient(CONVEX_URL, {
+    fetch: fetchWithTimeout as typeof globalThis.fetch,
+  });
+  private authPromise: Promise<void> | null = null;
 
   private async ensureAuth(): Promise<void> {
     if (this.authPromise) {
@@ -102,7 +262,7 @@ export class ProtectedApi {
         const token = await ensureValidJwt();
         this.client.setAuth(token);
       } catch (error) {
-        trackError("cli", error, { action: "cli_auth" });
+        trackCliError(error, { action: "cli_auth" });
         this.client.clearAuth();
         throw error;
       } finally {
@@ -118,14 +278,31 @@ export class ProtectedApi {
     return fn();
   }
 
-  async getCurrentUser(): Promise<User> {
+  private async fetchCurrentUser() {
     const result = await this.withAuth(() => this.client.query(api.user.getCurrentUser, {}));
-    return {
+    const user: User = {
       id: String(result.id),
       name: result.name,
       email: result.email,
       image: result.image ?? undefined,
       hasPro: result.hasPro ?? false,
+    };
+    return { result, user };
+  }
+
+  async getCurrentUser(): Promise<User> {
+    const { user } = await this.fetchCurrentUser();
+    return user;
+  }
+
+  async getFullUser(): Promise<FullUser> {
+    const { result, user } = await this.fetchCurrentUser();
+    return {
+      ...user,
+      publicKey: result.publicKey ?? undefined,
+      encryptedPrivateKey: result.encryptedPrivateKey ?? undefined,
+      salt: result.salt ?? undefined,
+      keysUpdatedAt: result.keysUpdatedAt ?? undefined,
     };
   }
 
@@ -141,27 +318,17 @@ export class ProtectedApi {
     const result = await this.withAuth(() =>
       this.client.query(api.projectShare.listActiveSharedProjectsForCurrentUser, {}),
     );
-    return result.shares.map(
-      (share: {
-        projectId: string;
-        projectName: string;
-        projectSlug: string;
-        status: string;
-        isRestricted: boolean;
-        isArchived: boolean;
-        ownerId?: string;
-      }) => ({
-        id: String(share.projectId),
-        name: share.projectName,
-        slug: share.projectSlug,
-        status: share.status as ProjectListItem["status"],
-        isRestricted: share.isRestricted,
-        isArchived: share.isArchived,
-        ownerId: share.ownerId,
-        createdAt: 0,
-        updatedAt: 0,
-      }),
-    );
+    return result.shares.map((share) => ({
+      id: String(share.projectId),
+      name: share.projectName,
+      slug: share.projectSlug,
+      status: share.status as ProjectListItem["status"],
+      isRestricted: share.isRestricted,
+      isArchived: share.isArchived,
+      ownerId: share.ownerId,
+      createdAt: 0,
+      updatedAt: 0,
+    }));
   }
 
   async getProjectEnvironments(projectId: string): Promise<Environment[]> {
@@ -173,9 +340,58 @@ export class ProtectedApi {
     return result.map((e) => ({
       id: String(e.id),
       name: e.name,
+      slug: e.slug,
       projectId: String(e.projectId),
       color: e.color,
+      rotateEveryDays: e.rotateEveryDays,
     }));
+  }
+
+  async getRotationStatus(
+    projectId: string,
+    environmentId?: string,
+  ): Promise<ProjectRotationStatus> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.rotation.getProjectRotationStatus, {
+        projectId: toId<"project">(projectId),
+        environmentId: environmentId ? toId<"environment">(environmentId) : undefined,
+      }),
+    );
+    return {
+      projectId: String(result.projectId),
+      projectName: result.projectName,
+      generatedAt: result.generatedAt,
+      secrets: result.secrets.map((s) => ({
+        ...s,
+        secretId: String(s.secretId),
+        environmentId: String(s.environmentId),
+        folderId: s.folderId ? String(s.folderId) : null,
+      })),
+    };
+  }
+
+  async setSecretRotationPolicy(
+    secretId: string,
+    rotateEveryDays: number | null,
+  ): Promise<{ success: boolean }> {
+    return await this.withAuth(() =>
+      this.client.mutation(api.rotation.setSecretRotationPolicy, {
+        secretId: toId<"secret">(secretId),
+        rotateEveryDays,
+      }),
+    );
+  }
+
+  async setEnvironmentRotationPolicy(
+    environmentId: string,
+    rotateEveryDays: number | null,
+  ): Promise<{ success: boolean }> {
+    return await this.withAuth(() =>
+      this.client.mutation(api.rotation.setEnvironmentRotationPolicy, {
+        environmentId: toId<"environment">(environmentId),
+        rotateEveryDays,
+      }),
+    );
   }
 
   async getEnvironmentData(environmentId: string): Promise<EnvironmentData> {
@@ -204,21 +420,6 @@ export class ProtectedApi {
     };
   }
 
-  async getFullUser(): Promise<FullUser> {
-    const result = await this.withAuth(() => this.client.query(api.user.getCurrentUser, {}));
-    return {
-      id: String(result.id),
-      name: result.name,
-      email: result.email,
-      image: result.image ?? undefined,
-      hasPro: result.hasPro ?? false,
-      publicKey: result.publicKey ?? undefined,
-      encryptedPrivateKey: result.encryptedPrivateKey ?? undefined,
-      salt: result.salt ?? undefined,
-      keysUpdatedAt: result.keysUpdatedAt ?? undefined,
-    };
-  }
-
   async getProject(projectId: string): Promise<Project> {
     const result = await this.withAuth(() =>
       this.client.query(api.project.getProject, {
@@ -232,6 +433,33 @@ export class ProtectedApi {
       encryptedProjectKey: result.encryptedProjectKey,
       keyVersion: result.keyVersion,
       isArchived: result.isArchived,
+      ownerId: String(result.ownerId),
+    };
+  }
+
+  async updateSecretBulk(args: {
+    environmentId: string;
+    folderId?: string;
+    secrets: BulkSecretInput[];
+    mode?: "skip" | "overwrite";
+  }): Promise<BulkUpdateResult> {
+    const result = await this.withAuth(() =>
+      this.client.mutation(api.secret.updateSecretBulk, {
+        environmentId: toId<"environment">(args.environmentId),
+        folderId: args.folderId ? toId<"folder">(args.folderId) : undefined,
+        secrets: args.secrets.map((s) => ({
+          secretId: s.secretId ? toId<"secret">(s.secretId) : undefined,
+          key: s.key,
+          encryptedValue: s.encryptedValue,
+          valueType: s.valueType,
+          scope: s.scope,
+        })),
+        mode: args.mode,
+      }),
+    );
+    return {
+      ...result,
+      secretIds: result.secretIds.map((id) => String(id)),
     };
   }
 
@@ -261,8 +489,8 @@ export class ProtectedApi {
     return await this.withAuth(() =>
       this.client.query(api.environment.getSecretsCacheValidation, {
         projectId: toId<"project">(projectId),
-        environmentId: environmentId ? toId<"environment">(environmentId) : undefined,
-        folderId: folderId ? toId<"folder">(folderId) : undefined,
+        environmentId: toOptionalId<"environment">(environmentId),
+        folderId: toOptionalId<"folder">(folderId),
       }),
     );
   }
@@ -273,28 +501,20 @@ export class ProtectedApi {
     environmentId?: string;
     folderName?: string;
     folderId?: string;
-    scope?: "client" | "server" | "shared";
-  }): Promise<{
-    secrets: SecretData[];
-    count: number;
-    encryptedProjectKey: string;
-    environmentId: string;
-    folderId: string | null;
-  }> {
-    const result: {
-      secrets: SecretData[];
-      count: number;
-      encryptedProjectKey: string;
-      environmentId: string;
-      folderId: string | null;
-    } = await this.withAuth(() =>
+    scope?: SecretScope;
+    scopes?: SecretScope[];
+    push?: PushAuditInfo;
+  }): Promise<ExportSecretsResult> {
+    const result = await this.withAuth(() =>
       this.client.mutation(api.secret.exportSecrets, {
         projectId: toId<"project">(args.projectId),
         environmentName: args.environmentName,
-        environmentId: args.environmentId ? toId<"environment">(args.environmentId) : undefined,
+        environmentId: toOptionalId<"environment">(args.environmentId),
         folderName: args.folderName,
-        folderId: args.folderId ? toId<"folder">(args.folderId) : undefined,
+        folderId: toOptionalId<"folder">(args.folderId),
         scope: args.scope,
+        scopes: args.scopes,
+        push: args.push,
       }),
     );
 
@@ -305,6 +525,53 @@ export class ProtectedApi {
       environmentId: String(result.environmentId),
       folderId: result.folderId ? String(result.folderId) : null,
     };
+  }
+
+  async listSecretNames(args: SecretNamesRequest & { projectId: string }): Promise<SecretNames> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.secret.listSecretNames, {
+        projectId: toId<"project">(args.projectId),
+        environmentName: args.environmentName,
+        folderName: args.folderName,
+        scope: args.scope,
+      }),
+    );
+    return { secrets: result.secrets, count: result.count };
+  }
+
+  async getSecretHistory(args: {
+    projectId: string;
+    environmentName: string;
+    folderName?: string;
+    key: string;
+  }): Promise<SecretHistory> {
+    const result = await this.withAuth(() =>
+      this.client.query(api.secretHistory.getSecretHistoryByKey, {
+        projectId: toId<"project">(args.projectId),
+        environmentName: args.environmentName,
+        folderName: args.folderName,
+        key: args.key,
+      }),
+    );
+    return {
+      secret: { ...result.secret, id: String(result.secret.id) },
+      versions: result.versions.map((entry) => ({ ...entry, id: String(entry.id) })),
+      encryptedProjectKey: result.encryptedProjectKey,
+      retentionLimit: result.retentionLimit,
+    };
+  }
+
+  async restoreSecretVersion(
+    secretId: string,
+    version: number,
+  ): Promise<{ restoredVersion: number; wasDeleted: boolean }> {
+    const result = await this.withAuth(() =>
+      this.client.mutation(api.secretHistory.restoreSecretVersion, {
+        secretId: toId<"secret">(secretId),
+        version,
+      }),
+    );
+    return { restoredVersion: result.restoredVersion, wasDeleted: result.wasDeleted };
   }
 
   async createServiceAccount(args: {
@@ -323,18 +590,8 @@ export class ProtectedApi {
   }): Promise<{ id: string; tokenPrefix: string }> {
     const result = await this.withAuth(() =>
       this.client.mutation(api.serviceAccount.createServiceAccount, {
+        ...args,
         projectId: toId<"project">(args.projectId),
-        name: args.name,
-        publicKey: args.publicKey,
-        encryptedPrivateKey: args.encryptedPrivateKey,
-        salt: args.salt,
-        encryptedProjectKey: args.encryptedProjectKey,
-        hashedToken: args.hashedToken,
-        tokenPrefix: args.tokenPrefix,
-        expiresAt: args.expiresAt,
-        oidcIssuer: args.oidcIssuer,
-        oidcSubjectPattern: args.oidcSubjectPattern,
-        oidcAudience: args.oidcAudience,
       }),
     );
     return { id: String(result.id), tokenPrefix: result.tokenPrefix };
@@ -348,45 +605,19 @@ export class ProtectedApi {
   }): Promise<{ success: boolean }> {
     return await this.withAuth(() =>
       this.client.mutation(api.serviceAccount.updateOidcPolicy, {
+        ...args,
         serviceAccountId: toId<"serviceAccount">(args.serviceAccountId),
-        oidcIssuer: args.oidcIssuer,
-        oidcSubjectPattern: args.oidcSubjectPattern,
-        oidcAudience: args.oidcAudience,
       }),
     );
   }
 
-  async listServiceAccounts(projectId: string): Promise<
-    Array<{
-      id: string;
-      name: string;
-      tokenPrefix: string;
-      oidcIssuer?: string;
-      oidcSubjectPattern?: string;
-      oidcAudience?: string;
-      expiresAt?: number;
-      revokedAt?: number;
-      lastUsedAt?: number;
-      createdAt: number;
-    }>
-  > {
+  async listServiceAccounts(projectId: string): Promise<ServiceAccount[]> {
     const result = await this.withAuth(() =>
       this.client.query(api.serviceAccount.listServiceAccounts, {
         projectId: toId<"project">(projectId),
       }),
     );
-    return result.map((sa) => ({
-      id: String(sa.id),
-      name: sa.name,
-      tokenPrefix: sa.tokenPrefix,
-      oidcIssuer: sa.oidcIssuer,
-      oidcSubjectPattern: sa.oidcSubjectPattern,
-      oidcAudience: sa.oidcAudience,
-      expiresAt: sa.expiresAt,
-      revokedAt: sa.revokedAt,
-      lastUsedAt: sa.lastUsedAt,
-      createdAt: sa.createdAt,
-    }));
+    return result.map((sa) => ({ ...sa, id: String(sa.id) }));
   }
 
   async revokeServiceAccount(serviceAccountId: string): Promise<{ success: boolean }> {
@@ -416,24 +647,60 @@ export class ProPlanRequiredError extends Error {
   }
 }
 
-export interface ExportSecretsHttpResponse {
-  secrets: {
-    id: string;
-    key: string;
-    encryptedValue: string;
-    scope: "client" | "server" | "shared";
-    valueType: "string" | "number" | "boolean";
-  }[];
-  count: number;
-  encryptedProjectKey: string;
-  environmentId: string;
-  folderId: string | null;
-}
+export type ExportSecretsHttpResponse = ExportSecretsResult;
 
 export interface UserCryptoKeysResponse {
   encryptedPrivateKey: string;
   salt: string;
   publicKey: string;
+}
+
+export interface ServiceAccountExportResponse extends ExportSecretsResult {
+  encryptedPrivateKey: string;
+  salt: string;
+}
+
+async function requestSiteApi<T>(
+  path: string,
+  options: {
+    token: string;
+    proPlanMessage: string;
+    body?: unknown;
+    headers?: Record<string, string>;
+  },
+): Promise<T> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${options.token}`,
+    ...options.headers,
+  };
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const response = await fetchWithTimeout(`${CONVEX_SITE_URL}${path}`, {
+    method: options.body === undefined ? "GET" : "POST",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+
+  if (!response.ok) {
+    const parsed = (await response.json().catch(() => null)) as {
+      error?: string;
+      code?: string;
+      upgradeUrl?: string;
+    } | null;
+
+    if (response.status === 402 || parsed?.code === "PRO_PLAN_REQUIRED") {
+      throw new ProPlanRequiredError(
+        parsed?.error || options.proPlanMessage,
+        parsed?.upgradeUrl || UPGRADE_URL,
+      );
+    }
+
+    throw new Error(parsed?.error ?? `HTTP ${response.status}`);
+  }
+
+  return (await response.json()) as T;
 }
 
 export async function exportSecretsViaApiKey(
@@ -443,117 +710,84 @@ export async function exportSecretsViaApiKey(
     environmentName: string;
     folderName?: string;
     scope?: string;
+    scopes?: string[];
+    push?: PushAuditInfo;
   },
 ): Promise<ExportSecretsHttpResponse> {
-  const url = `${CONVEX_SITE_URL}/api/secrets/export`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
+  return requestSiteApi("/api/secrets/export", {
+    token: apiKey,
+    body,
+    proPlanMessage: "API keys require a Pro plan.",
   });
-
-  if (!response.ok) {
-    const errorBody = await response.json().catch(() => null);
-    const parsed = errorBody as { error?: string; code?: string; upgradeUrl?: string } | null;
-
-    if (response.status === 402 || parsed?.code === "PRO_PLAN_REQUIRED") {
-      throw new ProPlanRequiredError(
-        parsed?.error || "API keys require a Pro plan.",
-        parsed?.upgradeUrl || `${SITE_URL}/dashboard?action=upgrade`,
-      );
-    }
-
-    throw new Error(parsed?.error ?? `HTTP ${response.status}`);
-  }
-
-  return (await response.json()) as ExportSecretsHttpResponse;
-}
-
-export interface ServiceAccountExportResponse {
-  secrets: {
-    id: string;
-    key: string;
-    encryptedValue: string;
-    scope: "client" | "server" | "shared";
-    valueType: "string" | "number" | "boolean";
-  }[];
-  count: number;
-  environmentId: string;
-  folderId: string | null;
-  encryptedProjectKey: string;
-  encryptedPrivateKey: string;
-  salt: string;
 }
 
 export async function exportSecretsViaServiceToken(
   serviceToken: string,
   body: {
-    environmentName: string;
+    environmentName?: string;
     folderName?: string;
     scope?: string;
+    scopes?: string[];
+    push?: PushAuditInfo;
   },
   oidcToken?: string,
 ): Promise<ServiceAccountExportResponse> {
-  const url = `${CONVEX_SITE_URL}/api/sa/secrets/export`;
-
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${serviceToken}`,
-    "Content-Type": "application/json",
-  };
-  if (oidcToken) {
-    headers["X-Oidc-Token"] = oidcToken;
-  }
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
+  return requestSiteApi("/api/sa/secrets/export", {
+    token: serviceToken,
+    body,
+    headers: oidcToken ? { "X-Oidc-Token": oidcToken } : undefined,
+    proPlanMessage: "Service accounts require a Pro plan.",
   });
+}
 
-  if (!response.ok) {
-    const errorBody = await response.json().catch(() => null);
-    const parsed = errorBody as { error?: string; code?: string; upgradeUrl?: string } | null;
+async function requestSecretNames(
+  path: string,
+  options: Parameters<typeof requestSiteApi>[1],
+): Promise<SecretNames> {
+  const result = await requestSiteApi<SecretNames>(path, options);
+  return { secrets: result.secrets, count: result.count };
+}
 
-    if (response.status === 402 || parsed?.code === "PRO_PLAN_REQUIRED") {
-      throw new ProPlanRequiredError(
-        parsed?.error || "Service accounts require a Pro plan.",
-        parsed?.upgradeUrl || `${SITE_URL}/dashboard?action=upgrade`,
-      );
-    }
+export async function listSecretNamesViaApiKey(
+  apiKey: string,
+  body: SecretNamesRequest & { projectId: string },
+): Promise<SecretNames> {
+  return requestSecretNames("/api/secrets/names", {
+    token: apiKey,
+    body,
+    proPlanMessage: "API keys require a Pro plan.",
+  });
+}
 
-    throw new Error(parsed?.error ?? `HTTP ${response.status}`);
-  }
+export async function listSecretNamesViaServiceToken(
+  serviceToken: string,
+  body: SecretNamesRequest,
+  oidcToken?: string,
+): Promise<SecretNames> {
+  return requestSecretNames("/api/sa/secrets/names", {
+    token: serviceToken,
+    body,
+    headers: oidcToken ? { "X-Oidc-Token": oidcToken } : undefined,
+    proPlanMessage: "Service accounts require a Pro plan.",
+  });
+}
 
-  return (await response.json()) as ServiceAccountExportResponse;
+export async function getRotationStatusViaServiceToken(
+  serviceToken: string,
+  body: { environmentName?: string },
+  oidcToken?: string,
+): Promise<ProjectRotationStatus> {
+  return requestSiteApi("/api/sa/rotation/status", {
+    token: serviceToken,
+    body,
+    headers: oidcToken ? { "X-Oidc-Token": oidcToken } : undefined,
+    proPlanMessage: "Service accounts require a Pro plan.",
+  });
 }
 
 export async function fetchUserKeysViaApiKey(apiKey: string): Promise<UserCryptoKeysResponse> {
-  const url = `${CONVEX_SITE_URL}/api/user/keys`;
-
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
+  return requestSiteApi("/api/user/keys", {
+    token: apiKey,
+    proPlanMessage: "API keys require a Pro plan.",
   });
-
-  if (!response.ok) {
-    const errorBody = await response.json().catch(() => null);
-    const parsed = errorBody as { error?: string; code?: string; upgradeUrl?: string } | null;
-
-    if (response.status === 402 || parsed?.code === "PRO_PLAN_REQUIRED") {
-      throw new ProPlanRequiredError(
-        parsed?.error || "API keys require a Pro plan.",
-        parsed?.upgradeUrl || `${SITE_URL}/dashboard?action=upgrade`,
-      );
-    }
-
-    throw new Error(parsed?.error ?? `HTTP ${response.status}`);
-  }
-
-  return (await response.json()) as UserCryptoKeysResponse;
 }

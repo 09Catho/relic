@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, test } from "bun:test";
 import {
   type CachedUserKeys,
   cacheUserKeys,
@@ -8,14 +8,13 @@ import {
 } from "@repo/auth";
 import {
   cacheEnvironments,
-  cacheFolders,
   cacheProject,
   cacheSecrets,
   getCachedEnvironmentId,
   getCachedFolderId,
   getCachedSecrets,
   initializeSchema,
-} from "helpers/cache";
+} from "../helpers/cache";
 import type { FullUser, ProtectedApi, SecretData } from "../lib/api";
 import { prepareSecrets, type RunOptions } from "./run";
 
@@ -124,8 +123,12 @@ describe("prepareSecrets", () => {
   beforeEach(() => {
     db = createProjectCacheDb();
     userKeyDb = createUserKeyCacheDb();
-    mockGetProjectKey.mockClear();
-    mockDecryptSecrets.mockClear();
+    mockGetProjectKey.mockReset();
+    mockGetProjectKey.mockImplementation(() =>
+      Promise.resolve("mock_crypto_key" as unknown as CryptoKey),
+    );
+    mockDecryptSecrets.mockReset();
+    mockDecryptSecrets.mockImplementation(() => Promise.resolve(MOCK_DECRYPTED_SECRETS));
   });
 
   test("should return decrypted secrets not using cache data", async () => {
@@ -380,6 +383,39 @@ describe("prepareSecrets", () => {
     const allCached = getCachedSecrets(db, PROJECT_ID, "env_123", undefined, undefined);
     expect(allCached).not.toBeNull();
     expect(allCached!.length).toBe(2);
+  });
+
+  test("should bypass the cache and send push audit metadata for push exports", async () => {
+    cacheUserKeys(userKeyDb, MOCK_USER_KEYS);
+    seedSecretCache(db);
+    mockDecryptSecrets.mockImplementation(() =>
+      Promise.resolve([{ key: "API_KEY", value: "my-api-key" }]),
+    );
+
+    const api = createMockApi({
+      getSecretsCacheValidation: mock(() => Promise.resolve({ updatedAt: 1 })),
+      exportSecrets: mock(() =>
+        Promise.resolve({ ...MOCK_EXPORT_RESULT, secrets: [MOCK_SECRETS[0]!], count: 1 }),
+      ),
+    });
+    const push = { target: "vercel", destination: "prj_1 (production)" };
+
+    const result = await prepareSecrets(PROJECT_ID, DEFAULT_OPTIONS, db, userKeyDb, api, {
+      scopes: ["client", "shared"],
+      push,
+    });
+
+    expect(api.getSecretsCacheValidation).not.toHaveBeenCalled();
+    expect(api.exportSecrets).toHaveBeenCalledWith({
+      projectId: PROJECT_ID,
+      environmentName: "development",
+      folderName: undefined,
+      scope: undefined,
+      scopes: ["client", "shared"],
+      push,
+    });
+    expect(result.secrets).toEqual({ API_KEY: "my-api-key" });
+    expect(getCachedSecrets(db, PROJECT_ID, "env_123", undefined, undefined)).toHaveLength(2);
   });
 
   test("should serve scoped request from cache after unscoped run", async () => {
