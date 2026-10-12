@@ -17,13 +17,13 @@ export const metadata: Metadata = {
     locale: "en_US",
     url: "/dpa",
     siteName: SITE_NAME,
-    title: "Data Processing Agreement - relic",
+    title: "Data Processing Agreement - Relic",
     description:
       "Data Processing Agreement (DPA) for Relic, a zero-knowledge secrets management platform by Cupola Labs, LLC.",
   },
   twitter: {
     card: "summary",
-    title: "Data Processing Agreement - relic",
+    title: "Data Processing Agreement - Relic",
     description:
       "Data Processing Agreement (DPA) for Relic, a zero-knowledge secrets management platform by Cupola Labs, LLC.",
     creator: SITE_TWITTER_HANDLE,
@@ -282,8 +282,8 @@ export default function DpaPage() {
               </ul>
               <p className="mt-4 text-sm text-foreground/70 leading-relaxed">
                 For requests that cannot be handled self-service, contact us at{" "}
-                <a href="mailto:support@relic.so" className="text-foreground underline">
-                  support@relic.so
+                <a href="mailto:support@withrelic.com" className="text-foreground underline">
+                  support@withrelic.com
                 </a>
                 .
               </p>
@@ -306,8 +306,8 @@ export default function DpaPage() {
               <h2 className="text-lg font-semibold">10. Contact</h2>
               <p className="mt-4 text-sm text-foreground/70 leading-relaxed">
                 For questions about this DPA or to exercise any rights, contact us at{" "}
-                <a href="mailto:support@relic.so" className="text-foreground underline">
-                  support@relic.so
+                <a href="mailto:support@withrelic.com" className="text-foreground underline">
+                  support@withrelic.com
                 </a>
                 .
               </p>

@@ -1,5 +1,17 @@
 # @repo/cli
 
+## 0.9.4
+
+### Patch Changes
+
+- Fix `relic upgrade` upgrading the wrong copy when multiple global installs exist (npm vs bun). Detect install method from the running binary and warn when PATH has duplicates.
+
+## 0.9.3
+
+### Patch Changes
+
+- Use withrelic.com for docs links, install URLs, and production fallbacks.
+
 ## 0.9.2
 
 ### Patch Changes

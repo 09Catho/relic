@@ -1,9 +1,10 @@
 import { v } from "convex/values";
+import { getProjectOrThrow } from "./lib/data";
 import { doc } from "convex-helpers/validators";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { internalMutation, internalQuery } from "./_generated/server";
-import { assertProjectAccess } from "./lib/access";
+import { assertProjectWriteAccess } from "./lib/access";
 import { alreadyExistsError, createError, ErrorCode, notFoundError } from "./lib/errors";
 import { generateSlug } from "./lib/helpers";
 import { protectedMutation } from "./lib/middleware";
@@ -29,11 +30,9 @@ export const createFolder = protectedMutation({
       },
     );
 
-    const project: Doc<"project"> = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: environment.projectId,
-    });
+    const project: Doc<"project"> = await getProjectOrThrow(ctx, environment.projectId);
 
-    await assertProjectAccess(ctx, project);
+    await assertProjectWriteAccess(ctx, project);
 
     await checkRateLimit(ctx, "write");
 
@@ -85,9 +84,11 @@ export const updateFolder = protectedMutation({
       folderId: args.folderId,
     });
 
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: folder.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, folder.projectId);
+
+    await assertProjectWriteAccess(ctx, project);
+
+    await checkRateLimit(ctx, "write");
 
     if (args.name) {
       const existingFolder = await ctx.runQuery(internal.folder._loadFolderBySlug, {
@@ -103,10 +104,6 @@ export const updateFolder = protectedMutation({
         });
       }
     }
-
-    await assertProjectAccess(ctx, project);
-
-    await checkRateLimit(ctx, "write");
 
     const environment = await ctx.runQuery(internal.environment._loadEnvironmentById, {
       environmentId: folder.environmentId,
@@ -145,11 +142,9 @@ export const deleteFolder = protectedMutation({
       folderId: args.folderId,
     });
 
-    const project = await ctx.runQuery(internal.project._loadProjectById, {
-      projectId: folder.projectId,
-    });
+    const project = await getProjectOrThrow(ctx, folder.projectId);
 
-    await assertProjectAccess(ctx, project);
+    await assertProjectWriteAccess(ctx, project);
 
     await checkRateLimit(ctx, "delete");
 
@@ -168,6 +163,10 @@ export const deleteFolder = protectedMutation({
         severity: ErrorSeverity.High,
       });
     }
+
+    await ctx.runMutation(internal.secretHistory._deleteHistoryForFolder, {
+      folderId: args.folderId,
+    });
 
     await ctx.runMutation(internal.folder._deleteFolder, {
       folderId: args.folderId,
@@ -219,7 +218,6 @@ export const _loadFolderBySlug = internalQuery({
       .withIndex("by_environment_and_slug", (q) =>
         q.eq("environmentId", args.environmentId).eq("slug", args.slug),
       )
-      .filter((q) => q.eq(q.field("slug"), args.slug))
       .first();
 
     return folder;
@@ -291,11 +289,13 @@ export const _updateFolder = internalMutation({
       updatedAt: number;
       name?: string;
       slug?: string;
+      path?: string;
       description?: string;
     } = { updatedAt: Date.now() };
     if (args.updates.name !== undefined) {
       updates.name = args.updates.name;
       updates.slug = generateSlug(args.updates.name);
+      updates.path = `/${updates.slug}`;
     }
 
     await ctx.db.patch(args.folderId, updates);
@@ -310,6 +310,15 @@ export const _deleteFolder = internalMutation({
   },
   returns: v.object({ success: v.boolean() }),
   handler: async (ctx, args) => {
+    // Callers ensure no live secrets remain; purge soft-deleted ones so no orphans are left behind.
+    const secrets = await ctx.db
+      .query("secret")
+      .withIndex("by_folder", (q) => q.eq("folderId", args.folderId))
+      .collect();
+    for (const secret of secrets) {
+      await ctx.db.delete(secret._id);
+    }
+
     await ctx.db.delete(args.folderId);
 
     return { success: true };

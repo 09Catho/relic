@@ -9,7 +9,25 @@ import type { ErrorCode } from "../convex/lib/errors";
 
 // Re-export from setup-modules to avoid circular import / TDZ.
 // setup-modules has ZERO convex imports so it initializes before any convex code runs.
-export { betterAuthModules, mockAutumn, modules } from "./setup-modules";
+export { betterAuthModules, mockBilling, modules } from "./setup-modules";
+
+/** Puts a user on the given plan, both locally and in the mocked Autumn account. */
+export async function setPlan(
+  t: ReturnType<typeof convexTest>,
+  userId: BetterAuthId<"user">,
+  plan: "pro" | "free",
+) {
+  const { mockBilling } = await import("./setup-modules");
+  mockBilling.setPro(userId, plan === "pro");
+  await t.run(async (ctx) => {
+    await ctx.runMutation(
+      plan === "pro"
+        ? components.betterAuth.user.upgradeToPro
+        : components.betterAuth.user.downgradeToFree,
+      { userId },
+    );
+  });
+}
 
 export interface TestUser {
   userId: BetterAuthId<"user">;
@@ -39,7 +57,7 @@ const createTestUser = async (
   },
 ): Promise<TestUser> => {
   const name = "name".concat(randomString());
-  const email = name.concat("@relic.so");
+  const email = name.concat("@withrelic.com");
 
   const now = Date.now();
   const userId = await t.run(async (ctx) => {
@@ -110,10 +128,13 @@ const createTestUser = async (
   }
 };
 
-export async function getTestUsers(t: ReturnType<typeof convexTest>): Promise<TestUser[]> {
+export async function getTestUsers(
+  t: ReturnType<typeof convexTest>,
+  count = 10,
+): Promise<TestUser[]> {
   const testUsers: TestUser[] = [];
 
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < count; i++) {
     const user = await createTestUser(t, { hasKeys: true });
 
     testUsers.push(user);

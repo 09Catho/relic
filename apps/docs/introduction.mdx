@@ -27,7 +27,7 @@ Relic runs in the terminal. For the best experience with the TUI, use a modern t
 <Tabs>
   <Tab title="curl">
     ```bash
-    curl -fsSL https://relic.so/install | bash
+    curl -fsSL https://withrelic.com/install | bash
     ```
   </Tab>
   <Tab title="Homebrew">
@@ -118,7 +118,8 @@ When you run `relic run -e production`, all secrets in that environment are inje
     - `.relic/` directory for local cache
 
     <Info>
-      Add `.relic/` to your `.gitignore` to keep cache files out of version control.
+      `.relic/` contains its own `.gitignore`, so the cache stays out of version control. Commit
+      `relic.toml`.
     </Info>
 
   </Step>

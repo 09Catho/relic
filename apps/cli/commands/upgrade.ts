@@ -1,10 +1,17 @@
 import { exec, execSync } from "node:child_process";
+import { dirname } from "node:path";
 import { trackEvent } from "@repo/logger";
 import ora from "ora";
 import pc from "picocolors";
+import { exitWithTelemetry } from "../lib/telemetry";
 import pkg from "../package.json";
-
-type InstallMethod = "homebrew" | "npm" | "bun" | "unknown";
+import {
+  CURL_INSTALL_COMMAND,
+  detectInstallMethodFromExecutablePath,
+  type InstallMethod,
+  resolveExecutablePath,
+  resolveRealPath,
+} from "./upgrade.install-method";
 
 function tryExec(cmd: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -15,29 +22,79 @@ function tryExec(cmd: string): Promise<string> {
   });
 }
 
-async function detectInstallMethod(): Promise<InstallMethod> {
+/** `argv[0]` for script installs; `execPath` for standalone binaries (where `argv[0]` is "bun"). */
+function executableCandidates(): string[] {
+  const candidates = [resolveExecutablePath(), resolveRealPath(process.execPath)];
+  return [...new Set(candidates.filter((path): path is string => !!path))];
+}
+
+async function detectInstallMethod(): Promise<{ method: InstallMethod; exePath: string | null }> {
+  for (const exePath of executableCandidates()) {
+    const fromExecutable = detectInstallMethodFromExecutablePath(exePath);
+    if (fromExecutable) return { method: fromExecutable, exePath };
+  }
+
+  return { method: await probeInstallMethod(), exePath: null };
+}
+
+async function probeInstallMethod(): Promise<InstallMethod> {
   try {
     await tryExec("brew list relic 2>/dev/null");
     return "homebrew";
-  } catch (_) {
+  } catch {
     // not installed via homebrew
   }
 
   try {
     const result = await tryExec("npm list -g relic 2>/dev/null");
     if (result.includes("relic@")) return "npm";
-  } catch (_) {
+  } catch {
     // not installed via npm
   }
 
   try {
     const result = await tryExec("bun pm ls -g 2>/dev/null");
     if (result.includes("relic@")) return "bun";
-  } catch (_) {
+  } catch {
     // not installed via bun
   }
 
   return "unknown";
+}
+
+async function warnAboutDuplicateInstallations(currentExe: string | null): Promise<void> {
+  if (!currentExe) return;
+
+  try {
+    const stdout = await tryExec("which -a relic 2>/dev/null");
+    const paths = [...new Set(stdout.trim().split("\n").filter(Boolean))];
+    if (paths.length <= 1) return;
+
+    const currentResolved = resolveRealPath(currentExe);
+    const others = paths
+      .map((p) => resolveRealPath(p))
+      .filter((resolved) => resolved !== currentResolved);
+
+    if (others.length === 0) return;
+
+    console.log();
+    console.log(
+      pc.yellow(
+        "  Multiple relic installs on PATH — you may still run an older copy in new shells.",
+      ),
+    );
+    console.log(pc.dim(`  Upgraded via this binary: ${currentResolved}`));
+    for (const other of others) {
+      console.log(pc.dim(`  Also on PATH: ${other}`));
+    }
+    console.log(
+      pc.dim(
+        "  Remove the extra install (e.g. bun remove -g relic) or reorder PATH, then run relic version.",
+      ),
+    );
+  } catch {
+    // ignore
+  }
 }
 
 async function getLatestVersion(): Promise<string | null> {
@@ -60,12 +117,23 @@ const UPGRADE_COMMANDS: Record<Exclude<InstallMethod, "unknown">, string> = {
   homebrew: "brew upgrade relic",
   npm: "npm install -g relic@latest",
   bun: "bun install -g relic@latest",
+  curl: CURL_INSTALL_COMMAND,
 };
+
+/** The install script honours `RELIC_INSTALL_DIR`; reuse the directory of the running binary. */
+function upgradeEnv(method: InstallMethod, exePath: string | null): NodeJS.ProcessEnv {
+  if (method !== "curl" || !exePath) return process.env;
+  return { ...process.env, RELIC_INSTALL_DIR: dirname(dirname(exePath)) };
+}
 
 export default async function upgrade() {
   const spinner = ora("Checking for updates...").start();
+  const runningExe = resolveExecutablePath();
 
-  const [method, latestVersion] = await Promise.all([detectInstallMethod(), getLatestVersion()]);
+  const [{ method, exePath }, latestVersion] = await Promise.all([
+    detectInstallMethod(),
+    getLatestVersion(),
+  ]);
 
   const currentVersion = pkg.version;
 
@@ -89,6 +157,7 @@ export default async function upgrade() {
     console.log(`  ${pc.dim("Upgrade manually using one of:")}`);
     console.log(`    ${pc.cyan("brew upgrade relic")}`);
     console.log(`    ${pc.cyan("npm install -g relic@latest")}`);
+    console.log(`    ${pc.cyan(CURL_INSTALL_COMMAND)}`);
     console.log();
     console.log(
       `  ${pc.dim("Or download from")} ${pc.white("https://github.com/heycupola/relic/releases")}`,
@@ -108,7 +177,7 @@ export default async function upgrade() {
     : `Upgrading via ${method}...`;
 
   try {
-    execSync(upgradeCmd, { stdio: "inherit" });
+    execSync(upgradeCmd, { stdio: "inherit", env: upgradeEnv(method, exePath) });
     spinner.succeed(
       latestVersion
         ? `Upgraded to ${pc.green(`v${latestVersion}`)} via ${method}`
@@ -120,6 +189,7 @@ export default async function upgrade() {
       from: currentVersion,
       to: latestVersion,
     });
+    await warnAboutDuplicateInstallations(runningExe);
   } catch {
     spinner.fail(pc.red(`Failed to upgrade via ${method}`));
     console.log(pc.dim(`  Try manually: ${upgradeCmd}`));
@@ -128,6 +198,6 @@ export default async function upgrade() {
       method,
       success: false,
     });
-    process.exit(1);
+    await exitWithTelemetry(1);
   }
 }

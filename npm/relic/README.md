@@ -11,6 +11,9 @@ npm install -g relic
 # Homebrew
 brew install heycupola/tap/relic
 
+# Install script (installs to ~/.relic/bin)
+curl -fsSL https://withrelic.com/install | bash
+
 # Download binary
 curl -fsSL https://github.com/heycupola/relic/releases/latest/download/relic-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m).tar.gz | tar -xz -C /usr/local/bin
 ```
@@ -27,10 +30,22 @@ relic login
 # Initialize a project
 relic init
 
+# Import an existing .env file
+relic import -e production
+
 # Run a command with secrets injected
 relic run -e production -- npm run deploy
 relic run -e staging -f database -- ./migrate.sh
 relic run -e production -s client -- npm run build
+
+# Open a subshell with secrets loaded (type `exit` to leave)
+relic shell -e development
+
+# Sync secrets to a deploy platform
+relic push -e production --target vercel --dry-run
+# Block commits that leak secrets or dotenv files
+relic guard install
+relic guard scan --staged
 ```
 
 ## Commands
@@ -44,6 +59,20 @@ relic run -e production -s client -- npm run build
 | `relic projects` | List projects with environments and folders |
 | `relic init` | Create `relic.toml` for the current project |
 | `relic run` | Run a command with secrets injected |
+| `relic shell` | Open a subshell with secrets loaded |
+| `relic import` | Import secrets from a `.env`/JSON file, Doppler, Infisical, Vercel, or 1Password |
+| `relic push` | Sync secrets to Vercel, Cloudflare Workers, GitHub Actions, or Fly.io |
+| `relic check` | Check that required keys exist in an environment (names only) |
+| `relic guard scan` | Scan files, staged changes, or commits for leaked secrets |
+| `relic guard install` | Add a pre-commit hook that blocks leaks |
+| `relic guard uninstall` | Remove the guard pre-commit hook |
+| `relic secrets` | List secret names in an environment (never values) |
+| `relic history` | List previous versions of a secret |
+| `relic rollback` | Restore a previous version or a deleted secret |
+| `relic service-account` | Create, list, and revoke service accounts for CI/CD |
+| `relic mcp` | Start the MCP server for AI assistants |
+| `relic upgrade` | Upgrade to the latest version |
+| `relic version` | Print the installed version |
 | `relic telemetry` | Manage anonymous usage data collection |
 
 ### `relic run` options
@@ -53,26 +82,61 @@ relic run -e production -s client -- npm run build
 | `-e, --environment` | Environment name (required) |
 | `-f, --folder` | Folder name |
 | `-s, --scope` | `client`, `server`, or `shared` |
-| `-p, --project` | Project ID (overrides `relic.toml`) |
+| `-p, --project` | Project ID (overrides `RELIC_PROJECT_ID` and `relic.toml`) |
+| `--inherit-env` | Pass the current environment (minus `RELIC_*`) to the command |
+
+By default the command only receives the secrets plus `PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`, and `TZ`. Options after the command name are passed to the command; use `--` to separate them explicitly.
+
+`relic shell` accepts the same options, plus `--force` to open a nested shell.
+
+### `relic push` options
+
+| Flag | Description |
+|------|-------------|
+| `-e, --environment` | Environment name (required) |
+| `-t, --target` | `vercel`, `cloudflare`, `github`, or `fly` (required) |
+| `-f, --folder` | Folder name |
+| `-s, --scope` | Comma separated: `client`, `server`, `shared` |
+| `--dry-run` | Print the plan (names only) and exit |
+| `--prune` | Delete platform secrets that are not in Relic |
+| `-y, --yes` | Skip confirmation (required in CI) |
+
+See [Platform Sync](https://docs.withrelic.com/guides/platform-sync) for platform options and authentication.
+
+### `relic check`
+
+Catch missing keys before a deploy. Compares names from `.env.example` (and optionally your source code) with an environment, without decrypting anything, and exits `1` if a key is missing.
+
+```bash
+relic check -e production
+relic check -e production --scan src --ignore NODE_ENV,PORT
+relic check -e staging --compare production
+```
+
+See the [`relic check` guide](https://docs.withrelic.com/guides/check) for all options.
 
 ## CI/CD
 
-Use API keys for non-interactive environments:
+Use a service account (recommended):
+
+```bash
+relic service-account create --name "ci-deploy" --github myorg/myrepo --branch main
+```
 
 ```yaml
 # GitHub Actions
 - name: Deploy with secrets
   env:
-    RELIC_API_KEY: ${{ secrets.RELIC_API_KEY }}
-    RELIC_PASSWORD: ${{ secrets.RELIC_PASSWORD }}
+    RELIC_SERVICE_TOKEN: ${{ secrets.RELIC_SERVICE_TOKEN }}
   run: npx relic run -e production -- npm run deploy
 ```
 
 | Variable | Description |
 |----------|-------------|
-| `RELIC_API_KEY` | API key for authentication |
-| `RELIC_PASSWORD` | Master password for decryption |
-| `RELIC_PROJECT_ID` | Project ID (optional if `relic.toml` exists) |
+| `RELIC_SERVICE_TOKEN` | Service account token (authentication and decryption) |
+| `RELIC_OIDC_TOKEN` | OIDC token; requested automatically in GitHub Actions, set via `id_tokens` in GitLab CI |
+
+`RELIC_API_KEY` + `RELIC_PASSWORD` still work but are deprecated because they put your master password in CI.
 
 ## Supported Platforms
 
@@ -85,6 +149,6 @@ Use API keys for non-interactive environments:
 
 ## Links
 
-- [Website](https://heyrelic.com)
-- [Documentation](https://docs.heyrelic.com)
+- [Website](https://withrelic.com)
+- [Documentation](https://docs.withrelic.com)
 - [GitHub](https://github.com/heycupola/relic)

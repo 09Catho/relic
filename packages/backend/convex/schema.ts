@@ -22,6 +22,7 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_project", ["projectId"])
+    .index("by_project_revoked", ["projectId", "revokedAt"])
     .index("by_hashedToken", ["hashedToken"])
     .index("by_createdBy", ["createdBy"]),
   project: defineTable({
@@ -37,6 +38,7 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_owner", ["ownerId"])
+    .index("by_owner_archived", ["ownerId", "isArchived"])
     .index("by_owner_slug", ["ownerId", "slug"]),
   projectShare: defineTable({
     projectId: v.id("project"),
@@ -50,7 +52,9 @@ export default defineSchema({
   })
     .index("by_project", ["projectId"])
     .index("by_user", ["userId"])
+    .index("by_user_active", ["userId", "revokedAt"])
     .index("by_project_user", ["projectId", "userId"])
+    .index("by_project_user_active", ["projectId", "userId", "revokedAt"])
     .index("by_project_active", ["projectId", "revokedAt"]),
   environment: defineTable({
     projectId: v.id("project"),
@@ -59,6 +63,7 @@ export default defineSchema({
     description: v.optional(v.string()),
     color: v.optional(v.string()),
     sortOrder: v.number(),
+    rotateEveryDays: v.optional(v.number()),
     createdBy: v.string(),
     createdAt: v.number(),
     updatedAt: v.number(),
@@ -94,17 +99,43 @@ export default defineSchema({
     encryptionKeyVersion: v.number(),
     tags: v.optional(v.array(v.string())),
     isDeleted: v.boolean(),
+    // Unset on rows written before rotation tracking; see inferValueChangedAt.
+    valueChangedAt: v.optional(v.number()),
+    rotateEveryDays: v.optional(v.number()),
     createdBy: v.string(),
     createdAt: v.number(),
     updatedBy: v.string(),
     updatedAt: v.number(),
   })
     .index("by_project", ["projectId"])
+    .index("by_project_deleted", ["projectId", "isDeleted"])
     .index("by_environment", ["environmentId"])
+    .index("by_environment_deleted", ["environmentId", "isDeleted"])
     .index("by_folder", ["folderId"])
     .index("by_env_and_key", ["environmentId", "key"])
+    .index("by_env_folder_key", ["environmentId", "folderId", "key", "isDeleted"])
     .index("by_created_by", ["createdBy"])
     .index("by_updated_by", ["updatedBy"]),
+  secretHistory: defineTable({
+    secretId: v.id("secret"),
+    projectId: v.id("project"),
+    environmentId: v.id("environment"),
+    folderId: v.optional(v.id("folder")),
+    key: v.string(),
+    version: v.number(),
+    encryptedValue: v.string(),
+    valueType: v.union(v.literal("string"), v.literal("number"), v.literal("boolean")),
+    scope: v.union(v.literal("client"), v.literal("server"), v.literal("shared")),
+    encryptionKeyVersion: v.number(),
+    changeType: v.union(v.literal("updated"), v.literal("deleted"), v.literal("restored")),
+    changedBy: v.string(),
+    changedAt: v.number(),
+  })
+    .index("by_secret_version", ["secretId", "version"])
+    .index("by_project", ["projectId"])
+    .index("by_project_key_version", ["projectId", "encryptionKeyVersion"])
+    .index("by_environment", ["environmentId"])
+    .index("by_folder", ["folderId"]),
   keyRotation: defineTable({
     projectId: v.id("project"),
     oldKeyVersion: v.number(),
@@ -113,6 +144,8 @@ export default defineSchema({
     reason: v.optional(v.string()),
     secretsReEncrypted: v.number(),
     sharesUpdated: v.number(),
+    historyReEncrypted: v.optional(v.number()),
+    historyPurged: v.optional(v.number()),
     createdAt: v.number(),
   }).index("by_project", ["projectId"]),
   actionLog: defineTable({
@@ -132,10 +165,12 @@ export default defineSchema({
       v.literal("secret.created"),
       v.literal("secret.updated"),
       v.literal("secret.deleted"),
+      v.literal("secret.restored"),
       v.literal("secret.exported"),
       v.literal("secrets.bulk.updated"),
       v.literal("secrets.bulk_deleted"),
       v.literal("secrets.bulk_exported"),
+      v.literal("secrets.pushed"),
       v.literal("environment.created"),
       v.literal("environment.updated"),
       v.literal("environment.deleted"),
@@ -153,6 +188,7 @@ export default defineSchema({
       v.literal("serviceaccount.created"),
       v.literal("serviceaccount.revoked"),
       v.literal("serviceaccount.oidc_updated"),
+      v.literal("rotation.policy_updated"),
     ),
     metadata: v.optional(
       v.object({
@@ -175,7 +211,15 @@ export default defineSchema({
         keyRotated: v.optional(v.boolean()),
         secretsReEncrypted: v.optional(v.number()),
         sharesUpdated: v.optional(v.number()),
+        historyReEncrypted: v.optional(v.number()),
+        historyPurged: v.optional(v.number()),
+        restoredVersion: v.optional(v.number()),
+        wasDeleted: v.optional(v.boolean()),
         apiKeyPrefix: v.optional(v.string()),
+        pushTarget: v.optional(v.string()),
+        pushDestination: v.optional(v.string()),
+        pushDryRun: v.optional(v.boolean()),
+        rotateEveryDays: v.optional(v.number()),
       }),
     ),
     timestamp: v.number(),
@@ -233,6 +277,15 @@ export default defineSchema({
   })
     .index("by_eventId_source", ["eventId", "source"])
     .index("by_processedAt", ["processedAt"]),
+  billingSync: defineTable({
+    userId: v.string(),
+    dirty: v.boolean(),
+    running: v.boolean(),
+    attempts: v.number(),
+    startedAt: v.optional(v.number()),
+    lastSyncedAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+  }).index("by_user", ["userId"]),
   deletedAccount: defineTable({
     anonymousId: v.string(),
     deletedAt: v.number(),
@@ -241,4 +294,9 @@ export default defineSchema({
     projectsDeleted: v.number(),
     sharesRevoked: v.number(),
   }).index("by_anonymousId", ["anonymousId"]),
+  rotationDigestSubscription: defineTable({
+    userId: v.string(),
+    lastSentAt: v.optional(v.number()),
+    createdAt: v.number(),
+  }).index("by_user", ["userId"]),
 });

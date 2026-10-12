@@ -1,26 +1,28 @@
+import { EXTRA_COLLABORATOR_PRICE_USD, PRO_COLLABORATORS_PER_PROJECT } from "./plans";
+
 export { SITE_DESCRIPTION, SITE_SLOGAN, SITE_TITLE } from "./site-copy";
 
-export const SITE_NAME = "relic";
+export const SITE_NAME = "Relic";
 export const SITE_BRAND_NAME = "Relic";
-export const SITE_URL = "https://relic.so";
+export const SITE_URL = "https://withrelic.com";
 export const SITE_AUTHOR = "Cupola";
 export const SITE_AUTHOR_URL = "https://cupo.la";
 export const SITE_TWITTER_HANDLE = "@heycupola";
 export const SITE_GITHUB_URL = "https://github.com/heycupola/relic";
 export const SITE_RELEASES_URL = `${SITE_GITHUB_URL}/releases`;
-export const SITE_DOCS_URL = "https://docs.relic.so";
+export const SITE_DOCS_URL = "https://docs.withrelic.com";
 export const SITE_X_URL = "https://x.com/heycupola";
-export const SITE_STATUS_URL = "https://status.relic.so";
+export const SITE_STATUS_URL = "https://status.withrelic.com";
 export const ENTERPRISE_URL =
   process.env.NEXT_PUBLIC_ENTERPRISE_URL || "https://form.typeform.com/to/JJ4KTKd7";
 export const BLOG_PATH = "/blog";
 export const CHANGELOG_PATH = "/changelog";
 export const BLOG_TITLE = "Blog";
 export const BLOG_DESCRIPTION =
-  "Product notes, design decisions, and technical writing about building relic.";
+  "Product notes, design decisions, and technical writing about building Relic.";
 export const CHANGELOG_TITLE = "Changelog";
 export const CHANGELOG_DESCRIPTION =
-  "Release notes, product improvements, and shipping updates from relic.";
+  "Release notes, product improvements, and shipping updates from Relic.";
 export const BLOG_FEED_PATH = "/blog/rss.xml";
 export const CHANGELOG_FEED_PATH = "/changelog/rss.xml";
 export const SITE_KEYWORDS = [
@@ -62,13 +64,12 @@ export const SITE_FAQS = [
   },
   {
     question: "Can I share secrets with my team?",
-    answer:
-      "Yes, invite teammates by email and they get access to the project. Each person's secrets are encrypted with their own keys, so sharing stays fully secure.",
+    answer: `Yes, project sharing is a Pro feature. Invite teammates by email and they get access to the project, with ${PRO_COLLABORATORS_PER_PROJECT} collaborators per project included and $${EXTRA_COLLABORATOR_PRICE_USD}/month per extra collaborator. Each person's secrets are encrypted with their own keys, so sharing stays fully secure.`,
   },
   {
     question: "Can I use Relic in CI/CD pipelines?",
     answer:
-      "Absolutely. The CLI is designed for automation. You can easily integrate Relic into GitHub Actions, GitLab CI, Jenkins, or any other CI/CD system.",
+      "Yes, with Pro. Service accounts, OIDC, and API keys let you plug Relic into GitHub Actions, GitLab CI, Jenkins, or any other CI/CD system without sharing personal credentials.",
   },
   {
     question: "Do my secrets sync across devices?",
